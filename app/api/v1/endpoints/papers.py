@@ -2,77 +2,27 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Backgro
 from typing import List
 import os
 from app.core.dependencies import get_current_user
-from app.schemas.document import PaperCreate, PaperOut, VersionOut
+from app.schemas.document import (
+    PaperCreate,
+    PaperOut,
+    PaperStatusCreate,
+    PaperStatusOut,
+    PaperStatusUpdate,
+    VersionOut,
+)
 from app.services.oss import upload_file_to_oss
-from datetime import datetime  
+from datetime import datetime
 from app.database import get_db
-import pymysql 
+import pymysql
 
 router = APIRouter()
 
-def init_paper_tables():
-    """初始化papers和paper_versions表（确保表存在）"""
-    db = None
-    cursor = None
-    try:
-        db = get_db() if callable(get_db) else pymysql.connect(
-            host=os.getenv("DB_HOST", "localhost"),
-            user=os.getenv("DB_USER", "root"),
-            password=os.getenv("DB_PASSWORD", ""),
-            database=os.getenv("DB_NAME", "paper_management"),
-            charset="utf8mb4"
-        )
-        cursor = db.cursor()
-
-        # 创建papers主表
-        create_papers_table = """
-        CREATE TABLE IF NOT EXISTS papers (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            owner_id INT NOT NULL,
-            latest_version VARCHAR(20) NOT NULL,
-            oss_key VARCHAR(255) NOT NULL,
-            created_at DATETIME NOT NULL,
-            updated_at DATETIME NOT NULL
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='论文基础信息表';
-        """
-        cursor.execute(create_papers_table)
-
-        # 创建paper_versions版本表
-        create_versions_table = """
-        CREATE TABLE IF NOT EXISTS paper_versions (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            paper_id INT NOT NULL,
-            version VARCHAR(20) NOT NULL,
-            size INT NOT NULL,
-            created_at DATETIME NOT NULL,
-            status VARCHAR(20) NOT NULL,
-            FOREIGN KEY (paper_id) REFERENCES papers(id) ON DELETE CASCADE
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='论文版本信息表';
-        """
-        cursor.execute(create_versions_table)
-
-        add_indexes = [
-            "CREATE INDEX IF NOT EXISTS idx_papers_owner_id ON papers(owner_id);",
-            "CREATE INDEX IF NOT EXISTS idx_paper_versions_paper_id ON paper_versions(paper_id);",
-            "CREATE INDEX IF NOT EXISTS idx_paper_versions_version ON paper_versions(version);"
-        ]
-        for idx_sql in add_indexes:
-            cursor.execute(idx_sql)
-
-        db.commit()
-        print("论文相关数据表初始化成功（表已存在则忽略）")
-    except pymysql.MySQLError as e:
-        if db:
-            db.rollback()
-        print(f"初始化论文数据表失败: {str(e)}")
-        raise
-    finally:
-        if cursor:
-            cursor.close()
-        if db:
-            db.close()
-
-@router.post("/upload", response_model=PaperOut)
+@router.post(
+    "/upload",
+    response_model=PaperOut,
+    summary="上传论文",
+    description="上传 docx 生成论文记录与首个版本"
+)
 async def upload_paper(
     file: UploadFile = File(...),
     db: pymysql.connections.Connection = Depends(get_db),
@@ -122,7 +72,219 @@ async def upload_paper(
     return PaperOut(id=paper_id, owner_id=current_user.get("sub", 0), latest_version=version, oss_key=oss_key)
 
 
-@router.get("/{paper_id}/versions", response_model=List[VersionOut])
+@router.put(
+    "/{paper_id}",
+    response_model=PaperOut,
+    summary="更新论文",
+    description="上传新版本并更新论文的最新版本信息"
+)
+async def update_paper(
+    paper_id: int,
+    file: UploadFile = File(...),
+    version: str = "v2.0",
+    db: pymysql.connections.Connection = Depends(get_db),
+):
+    current_user = {"sub": 1}
+    if not file.filename.lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="仅支持 .docx 格式")
+    contents = await file.read()
+    size = len(contents)
+    if size == 0:
+        raise HTTPException(status_code=400, detail="文件为空")
+    if size > 100 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="文件大小超过 100MB")
+
+    cursor = None
+    try:
+        cursor = db.cursor()
+        cursor.execute("SELECT owner_id FROM papers WHERE id = %s", (paper_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="论文不存在")
+        if row[0] != current_user.get("sub"):
+            raise HTTPException(status_code=403, detail="无权限更新该论文")
+
+        oss_key = upload_file_to_oss(file.filename, contents)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        cursor.execute(
+            """
+            UPDATE papers
+            SET latest_version = %s, oss_key = %s, updated_at = %s
+            WHERE id = %s
+            """,
+            (version, oss_key, now, paper_id),
+        )
+        cursor.execute(
+            """
+            INSERT INTO paper_versions (paper_id, version, size, created_at, updated_at, status)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (paper_id, version, size, now, now, "ok"),
+        )
+        db.commit()
+        return PaperOut(id=paper_id, owner_id=current_user.get("sub", 0), latest_version=version, oss_key=oss_key)
+    except pymysql.MySQLError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"数据库操作失败: {str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        db.close()
+
+
+@router.delete(
+    "/{paper_id}",
+    summary="删除论文",
+    description="删除论文记录及其版本信息"
+)
+def delete_paper(
+    paper_id: int,
+    db: pymysql.connections.Connection = Depends(get_db),
+):
+    current_user = {"sub": 1}
+    cursor = None
+    try:
+        cursor = db.cursor()
+        cursor.execute("SELECT owner_id FROM papers WHERE id = %s", (paper_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="论文不存在")
+        if row[0] != current_user.get("sub"):
+            raise HTTPException(status_code=403, detail="无权限删除该论文")
+
+        cursor.execute("DELETE FROM papers WHERE id = %s", (paper_id,))
+        db.commit()
+        return {"message": "删除成功", "paper_id": paper_id}
+    except pymysql.MySQLError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"数据库操作失败: {str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        db.close()
+
+
+@router.post(
+    "/{paper_id}/versions/{version}/status",
+    response_model=PaperStatusOut,
+    summary="创建论文状态",
+    description="为指定论文版本创建状态记录",
+)
+def create_paper_status(
+    paper_id: int,
+    version: str,
+    payload: PaperStatusCreate,
+    db: pymysql.connections.Connection = Depends(get_db),
+):
+    """Insert a status row for a paper version if it does not exist."""
+    cursor = None
+    try:
+        cursor = db.cursor()
+        cursor.execute("SELECT 1 FROM papers WHERE id = %s", (paper_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="论文不存在")
+
+        cursor.execute(
+            "SELECT id FROM paper_versions WHERE paper_id = %s AND version = %s",
+            (paper_id, version),
+        )
+        if cursor.fetchone():
+            raise HTTPException(status_code=409, detail="该版本状态已存在，可使用更新接口")
+
+        size = payload.size if payload.size is not None else 0
+        now = datetime.now()
+        cursor.execute(
+            """
+            INSERT INTO paper_versions (paper_id, version, size, created_at, status)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (paper_id, version, size, now.strftime("%Y-%m-%d %H:%M:%S"), payload.status),
+        )
+        db.commit()
+        return PaperStatusOut(
+            paper_id=paper_id,
+            version=version,
+            status=payload.status,
+            size=size,
+            updated_at=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"数据库操作失败: {str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        db.close()
+
+
+@router.put(
+    "/{paper_id}/versions/{version}/status",
+    response_model=PaperStatusOut,
+    summary="更新论文状态",
+    description="更新指定论文版本的状态信息",
+)
+def update_paper_status(
+    paper_id: int,
+    version: str,
+    payload: PaperStatusUpdate,
+    db: pymysql.connections.Connection = Depends(get_db),
+):
+    """Update status for an existing paper version."""
+    cursor = None
+    try:
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT size FROM paper_versions WHERE paper_id = %s AND version = %s",
+            (paper_id, version),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="该版本不存在")
+
+        new_size = payload.size if payload.size is not None else row[0]
+        now = datetime.now()
+        cursor.execute(
+            """
+            UPDATE paper_versions
+            SET status = %s, size = %s, updated_at = %s
+            WHERE paper_id = %s AND version = %s
+            """,
+            (
+                payload.status,
+                new_size,
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                paper_id,
+                version,
+            ),
+        )
+        db.commit()
+        return PaperStatusOut(
+            paper_id=paper_id,
+            version=version,
+            status=payload.status,
+            size=new_size,
+            updated_at=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"数据库操作失败: {str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        db.close()
+
+
+@router.get(
+    "/{paper_id}/versions",
+    response_model=List[VersionOut],
+    summary="查询论文版本列表",
+    description="按时间倒序返回指定论文的版本信息"
+)
 def list_versions(
     paper_id: int,
     # current_user=Depends(get_current_user),  # 保留验证代码，注释掉
@@ -167,4 +329,4 @@ def list_versions(
         if cursor:
             cursor.close()
         db.close()
-    return [VersionOut(version="v1.0", size=12345, created_at="2025-01-01T00:00:00Z", status="ok")]
+    return [VersionOut(version="v1.0", size=12345, created_at="2025-01-01T00:00:00Z", status="正常")]

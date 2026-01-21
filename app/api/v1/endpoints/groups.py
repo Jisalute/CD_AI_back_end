@@ -1,4 +1,5 @@
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
+from pydantic import BaseModel
 from app.core.dependencies import get_current_user
 from app.core.security import decode_access_token, create_access_token 
 from app.models.document import DocumentRecord  
@@ -12,7 +13,28 @@ from app.database import get_connection
 router = APIRouter()
 
 
-@router.post("/import")
+class GroupCreate(BaseModel):
+    """创建群组请求体"""
+
+    group_id: str
+    group_name: str
+    teacher_id: str | None = None
+    description: str | None = None
+
+
+class GroupMember(BaseModel):
+    """群组成员增删请求体"""
+
+    member_id: int
+    member_type: str  # 学生 student / 教师 teacher / 管理员 admin
+    role: str = "member"  # 成员 member / 管理员 admin
+
+
+@router.post(
+    "/import",
+    summary="导入群组与师生关系",
+    description="上传 TSV/CSV 文件批量导入群组及师生关系"
+)
 async def import_groups(
     file: UploadFile = File(...),
     #current_user=Depends(get_current_user),
@@ -112,7 +134,9 @@ async def import_groups(
                 content_type VARCHAR(100) NOT NULL,
                 content LONGBLOB NOT NULL,  # 存文件二进制内容
                 operated_by VARCHAR(50) NOT NULL,
-                operated_time DATETIME NOT NULL
+                operated_time DATETIME NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             )
             """)
             # 插入上传的文件
@@ -161,3 +185,188 @@ async def import_groups(
         "uploaded_file": file.filename,
         "file_format": file.filename.lower().split('.')[-1],
     }
+
+
+@router.post(
+    "/create",
+    summary="创建群组",
+    description="新增单个群组记录"
+)
+async def create_group(payload: GroupCreate, current_user: dict = {"roles": ["admin"], "username": "test_user"}):
+    required_roles = {"admin", "manager"}
+    if not required_roles & set(current_user.get("roles", [])):
+        raise HTTPException(status_code=403, detail="无创建群组权限，请联系管理员")
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        insert_sql = (
+            "INSERT INTO groups (group_id, group_name, teacher_id, description) "
+            "VALUES (%s, %s, %s, %s)"
+        )
+        cursor.execute(
+            insert_sql,
+            (
+                payload.group_id.strip(),
+                payload.group_name.strip(),
+                payload.teacher_id.strip() if payload.teacher_id else None,
+                payload.description.strip() if payload.description else None,
+            ),
+        )
+        conn.commit()
+        return {
+            "group_id": payload.group_id,
+            "group_name": payload.group_name,
+            "teacher_id": payload.teacher_id,
+            "description": payload.description,
+            "message": "群组创建成功",
+        }
+    except pymysql.err.IntegrityError:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail="群组编号已存在")
+    except pymysql.MySQLError as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+@router.delete(
+    "/{group_id}",
+    summary="删除群组",
+    description="根据群组编号删除群组"
+)
+async def delete_group(group_id: str, current_user: dict = {"roles": ["admin"], "username": "test_user"}):
+    required_roles = {"admin", "manager"}
+    if not required_roles & set(current_user.get("roles", [])):
+        raise HTTPException(status_code=403, detail="无删除群组权限，请联系管理员")
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM groups WHERE group_id = %s", (group_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="群组不存在")
+
+        cursor.execute("DELETE FROM groups WHERE group_id = %s", (group_id,))
+        conn.commit()
+        return {"group_id": group_id, "message": "群组已删除"}
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+@router.post(
+    "/{group_id}/members",
+    summary="添加群组成员",
+    description="为指定群组添加成员（学生/教师/管理员）"
+)
+async def add_group_member(group_id: str, payload: GroupMember, current_user: dict = {"roles": ["admin"], "username": "test_user"}):
+    required_roles = {"admin", "manager"}
+    if not required_roles & set(current_user.get("roles", [])):
+        raise HTTPException(status_code=403, detail="无添加成员权限，请联系管理员")
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT 1 FROM groups WHERE group_id = %s", (group_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="群组不存在")
+
+        cursor.execute(
+            """
+            INSERT INTO group_members (group_id, member_id, member_type, role)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE is_active = 1, role = VALUES(role)
+            """,
+            (group_id, payload.member_id, payload.member_type, payload.role),
+        )
+        conn.commit()
+        return {
+            "group_id": group_id,
+            "member_id": payload.member_id,
+            "member_type": payload.member_type,
+            "role": payload.role,
+            "message": "成员已添加/更新",
+        }
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+@router.delete(
+    "/{group_id}/members",
+    summary="删除群组成员",
+    description="从指定群组移除成员（软删除，设置 is_active=0）"
+)
+async def remove_group_member(group_id: str, payload: GroupMember, current_user: dict = {"roles": ["admin"], "username": "test_user"}):
+    required_roles = {"admin", "manager"}
+    if not required_roles & set(current_user.get("roles", [])):
+        raise HTTPException(status_code=403, detail="无删除成员权限，请联系管理员")
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT 1 FROM groups WHERE group_id = %s", (group_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="群组不存在")
+
+        cursor.execute(
+            """
+            SELECT 1 FROM group_members 
+            WHERE group_id = %s AND member_id = %s AND member_type = %s
+            """,
+            (group_id, payload.member_id, payload.member_type),
+        )
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="成员不在该群组")
+
+        cursor.execute(
+            """
+            UPDATE group_members 
+            SET is_active = 0 
+            WHERE group_id = %s AND member_id = %s AND member_type = %s
+            """,
+            (group_id, payload.member_id, payload.member_type),
+        )
+        conn.commit()
+        return {
+            "group_id": group_id,
+            "member_id": payload.member_id,
+            "member_type": payload.member_type,
+            "message": "成员已移除",
+        }
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        conn.close()

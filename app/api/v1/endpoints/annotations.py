@@ -10,7 +10,12 @@ from datetime import datetime
 router = APIRouter()
 
 
-@router.post("/", response_model=AnnotationOut)
+@router.post(
+    "/",
+    response_model=AnnotationOut,
+    summary="创建论文标注",
+    description="为指定论文创建标注并校验坐标后入库"
+)
 def create_annotation(
     # TODO: 权限与坐标校验，持久化到数据库
     payload: AnnotationCreate,
@@ -32,48 +37,7 @@ def create_annotation(
         logger.error(f"解析current_user失败: {str(e)}")
         current_user = {"sub": 0, "username": "", "roles": []}
 
-    try:
-        cursor = db.cursor()
-        # 创建papers表
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS papers (
-                id INT AUTO_INCREMENT PRIMARY KEY,  -- 论文ID（自增主键）
-                owner_id INT NOT NULL,             -- 所属用户ID
-                latest_version VARCHAR(20) NOT NULL, -- 最新版本号
-                oss_key VARCHAR(255) NOT NULL,     -- OSS文件存储键
-                created_at DATETIME NOT NULL,      -- 创建时间
-                updated_at DATETIME NOT NULL       -- 更新时间
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """
-        )
-        # 创建annotations表
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS annotations (
-                id INT PRIMARY KEY AUTO_INCREMENT,
-                paper_id INT NOT NULL,
-                author_id INT NOT NULL,
-                paragraph_id VARCHAR(50) NULL,
-                coordinates JSON NULL,
-                content TEXT NOT NULL,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (paper_id) REFERENCES papers(id) ON DELETE CASCADE,
-                INDEX idx_paper_id (paper_id),
-                INDEX idx_author_id (author_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """
-        )
-        db.commit()
-    except pymysql.MySQLError as e:
-        db.rollback()
-        logger.error(f"初始化数据表失败: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="数据表初始化失败，请稍后重试"
-        )
-    finally:
-        cursor.close()
+    # 表结构已由 database_setup.py 统一维护
 
     # 权限校验：验证当前用户是否有权限操作该论文
     try:

@@ -15,9 +15,9 @@ class Settings(BaseSettings):
     )
 
     # General
-    PROJECT_NAME: str = "CD AI Backend"
+    PROJECT_NAME: str = "CD AI 后端服务"
     VERSION: str = "0.1.0"
-    DESCRIPTION: str = "CD AI Backend API"
+    DESCRIPTION: str = "CD AI 后端 API 文档"
 
     # CORS - keep as raw string to avoid dotenv JSON decode issues; will parse after init
     CORS_ORIGINS: str = "*"
@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     DEBUG: bool = False
-    RELOAD: bool = False
+    RELOAD: bool = True
 
     # Database (can provide full DATABASE_URL or MYSQL_* parts)
     DATABASE_URL: str | None = None

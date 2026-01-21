@@ -18,16 +18,35 @@ class VersionOut(BaseModel):
     size: int
     created_at: str
     status: str
+
+
+class PaperStatusCreate(BaseModel):
+    status: str
+    size: int | None = None
+
+
+class PaperStatusUpdate(BaseModel):
+    status: str
+    size: int | None = None
+
+
+class PaperStatusOut(BaseModel):
+    paper_id: int
+    version: str
+    status: str
+    size: int
+    updated_at: str
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 
 
-class DocumentResponse(BaseModel):
+class MaterialResponse(BaseModel):
     id: int
     filename: str
     content_type: Optional[str] = None
     created_at: datetime
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

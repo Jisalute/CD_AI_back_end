@@ -26,7 +26,11 @@ def admin_only(
     return mock_admin_user
 
 
-@router.post("/templates")
+@router.post(
+    "/templates",
+    summary="上传模板",
+    description="上传模板文件并存储元数据"
+)
 async def upload_template(
     file: UploadFile = File(...),
     user=Depends(admin_only),
@@ -34,7 +38,7 @@ async def upload_template(
 ):
     content = await file.read()
     key = upload_file_to_oss(file.filename, content)
-    # TODO: persist template ID and metadata
+    # 待办：持久化模板 ID 及元数据
     # template_id = "tpl_1"
     template_id = f"tpl_{uuid.uuid4().hex[:8]}"  
     
@@ -49,24 +53,7 @@ async def upload_template(
     }
     
     try:
-        # 创建游标执行SQL操作
         cursor = db.cursor()
-        # 确保templates表存在
-        create_table_sql = """
-        CREATE TABLE IF NOT EXISTS templates (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            template_id VARCHAR(64) NOT NULL UNIQUE,
-            oss_key VARCHAR(255) NOT NULL,
-            filename VARCHAR(255) NOT NULL,
-            content_type VARCHAR(128),
-            uploader_id VARCHAR(64) NOT NULL,
-            upload_time DATETIME NOT NULL,
-            INDEX idx_template_id (template_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        """
-        cursor.execute(create_table_sql)
-        
-        # 插入模板元数据到数据库
         insert_sql = """
         INSERT INTO templates (template_id, oss_key, filename, content_type, uploader_id, upload_time)
         VALUES (%s, %s, %s, %s, %s, %s);
@@ -82,41 +69,118 @@ async def upload_template(
                 template_metadata["upload_time"]
             )
         )
-        db.commit()  # 提交事务
+        db.commit()
     except pymysql.MySQLError as e:
-        db.rollback()  # 异常时回滚事务
+        db.rollback()
         raise HTTPException(
             status_code=500,
             detail=f"模板元数据存储失败：{str(e)}"
         )
     finally:
-        cursor.close()  # 确保游标关闭
+        cursor.close()
     # 同时修改返回值的template_id为动态生成的ID
     # return {"template_id": "tpl_1", "oss_key": key}
     return {"template_id": template_id, "oss_key": key}
 
-@router.get("/dashboard/stats")
+
+@router.put(
+    "/templates/{template_id}",
+    summary="更新模板",
+    description="重新上传模板并更新元数据"
+)
+async def update_template(
+    template_id: str,
+    file: UploadFile = File(...),
+    user=Depends(admin_only),
+    db: pymysql.connections.Connection = Depends(get_db)
+):
+    content = await file.read()
+    key = upload_file_to_oss(file.filename, content)
+    upload_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor = None
+    try:
+        cursor = db.cursor()
+        cursor.execute("SELECT id FROM templates WHERE template_id = %s", (template_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="模板不存在")
+
+        update_sql = """
+        UPDATE templates
+        SET oss_key = %s,
+            filename = %s,
+            content_type = %s,
+            uploader_id = %s,
+            upload_time = %s
+        WHERE template_id = %s;
+        """
+        cursor.execute(
+            update_sql,
+            (
+                key,
+                file.filename,
+                file.content_type,
+                user.get("id"),
+                upload_time,
+                template_id,
+            ),
+        )
+        db.commit()
+        return {
+            "template_id": template_id,
+            "oss_key": key,
+            "filename": file.filename,
+            "content_type": file.content_type,
+            "upload_time": upload_time,
+        }
+    except pymysql.MySQLError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"模板更新失败：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+
+
+@router.delete(
+    "/templates/{template_id}",
+    summary="删除模板",
+    description="根据模板ID删除记录"
+)
+def delete_template(
+    template_id: str,
+    user=Depends(admin_only),
+    db: pymysql.connections.Connection = Depends(get_db)
+):
+    cursor = None
+    try:
+        cursor = db.cursor()
+        cursor.execute("SELECT id FROM templates WHERE template_id = %s", (template_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="模板不存在")
+
+        cursor.execute("DELETE FROM templates WHERE template_id = %s", (template_id,))
+        db.commit()
+        return {"message": "删除成功", "template_id": template_id}
+    except pymysql.MySQLError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"模板删除失败：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+
+@router.get(
+    "/dashboard/stats",
+    summary="仪表盘统计",
+    description="按学院汇总论文数量并返回总数"
+)
 def dashboard_stats(
     user=Depends(admin_only),  
     db: pymysql.connections.Connection = Depends(get_db) 
 ):
-    # TODO: 聚合 DB，按学院分组统计
+    # 待办：聚合数据库，按学院分组统计
     cursor = None
     try:
         cursor = db.cursor()
-        
-        # 确保用户-学院映射表存在
-        create_user_college_table = """
-        CREATE TABLE IF NOT EXISTS user_college_mapping (
-            user_id VARCHAR(64) NOT NULL PRIMARY KEY,
-            username VARCHAR(64) NOT NULL,
-            college VARCHAR(128) NOT NULL,
-            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            INDEX idx_college (college)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        """
-        cursor.execute(create_user_college_table)
-        
         # 聚合论文数据：按学院分组统计论文数量
         stats_sql = """
         SELECT 
@@ -162,14 +226,18 @@ def dashboard_stats(
             cursor.close()
 
 
-@router.get("/audit/logs")
+@router.get(
+    "/audit/logs",
+    summary="审计日志查询",
+    description="分页查询操作日志记录"
+)
 def audit_logs(
     user=Depends(admin_only),  
     page: int = 1,
     page_size: int = 50,
     db: pymysql.connections.Connection = Depends(get_db)  
 ):
-    # TODO: 查询操作日志表并返回分页结果
+    # 待办：查询操作日志表并返回分页结果
     cursor = None
     try:
         # 校验分页参数合法性
@@ -178,25 +246,7 @@ def audit_logs(
         if page_size < 1 or page_size > 100:  # 限制单页最大条数，避免性能问题
             page_size = 50
         
-        # 确保操作日志表存在（首次使用自动创建）
         cursor = db.cursor()
-        create_log_table_sql = """
-        CREATE TABLE IF NOT EXISTS operation_logs (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            user_id VARCHAR(64) NOT NULL,
-            username VARCHAR(64) NOT NULL,
-            operation_type VARCHAR(32) NOT NULL,
-            operation_path VARCHAR(255) NOT NULL,
-            operation_params JSON NULL,
-            ip_address VARCHAR(64) NULL,
-            operation_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            status VARCHAR(16) NOT NULL DEFAULT 'success',
-            INDEX idx_user_id (user_id),
-            INDEX idx_operation_time (operation_time)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        """
-        cursor.execute(create_log_table_sql)
-        
         # 计算分页偏移量
         offset = (page - 1) * page_size
         
