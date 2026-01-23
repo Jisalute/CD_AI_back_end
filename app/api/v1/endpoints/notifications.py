@@ -22,42 +22,77 @@ def push_notification(
 ):
     cursor = None
     try:
+        # 1. 核心参数校验
+        if not payload.target_user_id:
+            raise HTTPException(status_code=400, detail="目标用户ID（target_user_id）不能为空")
+        if not payload.title:
+            raise HTTPException(status_code=400, detail="消息标题（title）不能为空")
+        if not payload.content:
+            raise HTTPException(status_code=400, detail="消息内容（content）不能为空")
+        
         cursor = db.cursor()
-        # 组装 operation_params
-        op_params = {
-            "title": payload.title,
-            "content": payload.content,
-            "target_user_id": payload.target_user_id,
-            "target_username": payload.target_username,
-        }
         now = datetime.now()
-        # 示例：如果无真实登录，这里使用空用户标识
-        user_id = payload.target_user_id or "system"
-        username = payload.target_username or "system"
-        insert_sql = (
-            "INSERT INTO operation_logs (user_id, username, operation_type, operation_path, "
-            "operation_params, ip_address, operation_time, status) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
-        )
+        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 2. 安全获取可选字段（兼容模型中有无这些字段的情况）
+        # 使用 getattr 安全访问，避免 AttributeError
+        metadata = getattr(payload, "metadata", None)
+        source = getattr(payload, "source", None)
+        target_username = getattr(payload, "target_username", None)
+        
+        # 处理JSON字段
+        metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
+        # 处理source默认值
+        source_value = source or "system"
+        # 处理用户名默认值
+        username_value = target_username or ""
+        
+        # 3. 组装插入SQL（完全匹配 user_messages 表结构）
+        insert_sql = """
+        INSERT INTO user_messages (
+            user_id, username, title, content, source, status, 
+            received_time, metadata, created_at, updated_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        
+        # 4. 执行插入操作
         cursor.execute(
             insert_sql,
             (
-                user_id,
-                username,
-                "notify",
-                "/api/v1/notifications/push",
-                json.dumps(op_params, ensure_ascii=False),
-                None,
-                now.strftime("%Y-%m-%d %H:%M:%S"),
-                "success",
+                payload.target_user_id,  # user_id（接收用户ID）
+                username_value,          # username（接收用户名，可为空）
+                payload.title,           # title（消息标题）
+                payload.content,         # content（消息内容）
+                source_value,            # source（来源，默认system）
+                "unread",                # status（默认未读）
+                now_str,                 # received_time（接收时间）
+                metadata_json,           # metadata（扩展元数据，可为空）
+                now_str,                 # created_at（记录创建时间）
+                now_str                  # updated_at（记录更新时间）
             ),
         )
         db.commit()
-        return {"message": "推送成功", "id": cursor.lastrowid}
+        
+        # 5. 返回推送结果
+        return {
+            "message": "消息推送成功",
+            "message_id": cursor.lastrowid,  # 返回消息ID
+            "target_user_id": payload.target_user_id,
+            "title": payload.title
+        }
+        
+    except HTTPException:
+        # 重新抛出已定义的业务异常
+        raise
     except pymysql.MySQLError as e:
+        # 数据库异常回滚
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"日志写入失败：{str(e)}")
+        raise HTTPException(status_code=500, detail=f"消息记录写入失败：{str(e)}")
+    except Exception as e:
+        # 捕获所有其他异常，给出友好提示
+        raise HTTPException(status_code=500, detail=f"消息推送失败：{str(e)}")
     finally:
+        # 仅关闭游标，数据库连接由依赖管理
         if cursor:
             cursor.close()
 
@@ -74,62 +109,70 @@ def query_notifications(
     page_size: int = 20,
     db: pymysql.connections.Connection = Depends(get_db),
 ):
+    # 分页参数校验
     if page < 1:
         page = 1
     if page_size < 1 or page_size > 100:
         page_size = 20
-
     cursor = None
     try:
         cursor = db.cursor()
-        base_where = "operation_type = 'notify'"
+        # 构建查询条件（适配user_messages表）
+        base_where = "1=1" 
         params = []
+        # 按用户ID筛选
         if target_user_id:
             base_where += " AND user_id = %s"
             params.append(target_user_id)
-
-        count_sql = f"SELECT COUNT(*) FROM operation_logs WHERE {base_where}"
+        # 查询总记录数
+        count_sql = f"SELECT COUNT(*) FROM user_messages WHERE {base_where}"
         cursor.execute(count_sql, params)
         total = cursor.fetchone()[0]
-
+        # 分页查询数据
         offset = (page - 1) * page_size
-        select_sql = (
-            "SELECT id, user_id, username, operation_params, operation_time, status "
-            "FROM operation_logs WHERE " + base_where + " ORDER BY operation_time DESC LIMIT %s OFFSET %s"
-        )
+        select_sql = f"""
+        SELECT id, user_id, username, title, content, source, status, received_time, metadata 
+        FROM user_messages 
+        WHERE {base_where} 
+        ORDER BY received_time DESC 
+        LIMIT %s OFFSET %s
+        """
         cursor.execute(select_sql, params + [page_size, offset])
         rows = cursor.fetchall()
-
+        # 组装返回数据
         items = []
         for row in rows:
-            # row: (id, user_id, username, operation_params, operation_time, status)
+            # row结构：(id, user_id, username, title, content, source, status, received_time, metadata)
             try:
-                op_params = json.loads(row[3]) if row[3] else {}
+                metadata = json.loads(row[8]) if row[8] else {}
             except Exception:
-                op_params = {}
+                metadata = {}
             items.append(
                 NotificationItem(
                     id=row[0],
                     user_id=row[1],
-                    username=row[2],
-                    title=op_params.get("title", ""),
-                    content=op_params.get("content", ""),
-                    target_user_id=op_params.get("target_user_id"),
-                    target_username=op_params.get("target_username"),
-                    operation_time=row[4].strftime("%Y-%m-%d %H:%M:%S") if row[4] else None,
-                    status=row[5],
+                    username=row[2] or "",
+                    title=row[3],
+                    content=row[4],
+                    target_user_id=row[1],  # user_messages表中的user_id就是目标用户ID
+                    target_username=row[2], # username就是目标用户名
+                    operation_time=row[7].strftime("%Y-%m-%d %H:%M:%S") if row[7] else None,
+                    status=row[6],  # unread/read
                 )
             )
-
+        # 计算总页数
+        total_pages = (total + page_size - 1) // page_size
         return NotificationQueryResponse(
             items=items,
             page=page,
             page_size=page_size,
             total=total,
-            total_pages=(total + page_size - 1) // page_size,
+            total_pages=total_pages,
         )
     except pymysql.MySQLError as e:
         raise HTTPException(status_code=500, detail=f"查询失败：{str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询处理失败：{str(e)}")
     finally:
         if cursor:
             cursor.close()
