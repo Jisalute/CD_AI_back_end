@@ -31,11 +31,6 @@ def admin_only(
     summary="上传模板",
     description="上传模板文件并存储元数据"
 )
-@router.post(
-    "/templates",
-    summary="上传模板",
-    description="上传模板文件并存储元数据"
-)
 async def upload_template(
     file: UploadFile = File(...),
     user=Depends(admin_only),
@@ -176,12 +171,6 @@ def delete_template(
     finally:
         if cursor:
             cursor.close()
-
-@router.get(
-    "/dashboard/stats",
-    summary="仪表盘统计",
-    description="按学院汇总论文数量并返回总数"
-)
 
 @router.put(
     "/templates/{template_id}",
@@ -328,11 +317,6 @@ def dashboard_stats(
             cursor.close()
 
 
-@router.get(
-    "/audit/logs",
-    summary="审计日志查询",
-    description="分页查询操作日志记录"
-)
 @router.get(
     "/audit/logs",
     summary="审计日志查询",
