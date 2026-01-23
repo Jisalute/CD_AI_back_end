@@ -1,5 +1,5 @@
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query
+from typing import Optional
 from pydantic import BaseModel
 from app.core.dependencies import get_current_user
 from app.core.security import decode_access_token, create_access_token 
@@ -36,45 +36,18 @@ class GroupMember(BaseModel):
     summary="导入群组与师生关系",
     description="上传 TSV/CSV 文件批量导入群组及师生关系"
 )
-class GroupCreate(BaseModel):
-    """创建群组请求体"""
-
-    group_id: str
-    group_name: str
-    teacher_id: str | None = None
-    description: str | None = None
-
-
-class GroupMember(BaseModel):
-    """群组成员增删请求体"""
-
-    member_id: int
-    member_type: str  # 学生 student / 教师 teacher / 管理员 admin
-    role: str = "member"  # 成员 member / 管理员 admin
-
-
-@router.post(
-    "/import",
-    summary="导入群组与师生关系",
-    description="上传 TSV/CSV 文件批量导入群组及师生关系"
-)
 async def import_groups(
     file: UploadFile = File(...),
-    #current_user=Depends(get_current_user),
-    current_user = {"sub": 1, "username": "test_user", "roles": ["admin"]}
+    current_user: Optional[str] = Query(None),
 ):
    # 这里只做接收并返回模拟结果；实际应解析 Excel 并写入 db
-    try:
-        if isinstance(current_user, str):
-            # 解码URL编码的字符串
-            import urllib.parse
-            current_user = urllib.parse.unquote(current_user)
-            # 解析为字典
-            current_user = json.loads(current_user)
-        if not isinstance(current_user, dict):
-            current_user = {"sub": 0, "username": "", "roles": []}
-    except (json.JSONDecodeError, Exception) as e:
-        logger.error(f"解析current_user失败: {str(e)}")
+    if isinstance(current_user, str):
+        # 解码URL编码的字符串
+        import urllib.parse
+        current_user = urllib.parse.unquote(current_user)
+        # 解析为字典
+        current_user = json.loads(current_user)
+    if not isinstance(current_user, dict):
         current_user = {"sub": 0, "username": "", "roles": []}
 
     # 权限校验
