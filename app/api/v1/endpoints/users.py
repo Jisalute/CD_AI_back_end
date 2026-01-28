@@ -1,80 +1,234 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 import csv
 import io
 import pymysql
 from typing import List
 from app.schemas.user import (
-    UserCreate,
+    StudentCreate,
+    TeacherCreate,
+    AdminCreate,
     UserUpdate,
     UserOut,
     UserBindPhone,
     UserBindEmail,
 )
 from app.database import get_db
+from app.core.security import get_password_hash
 from loguru import logger
 
 router = APIRouter()
 SUPPORTED_IMPORT_EXTS = (".csv", ".tsv")
 
+USER_TABLES = {
+    "admin": {"table": "admins", "id_col": "admin_id", "role_col": "role"},
+    "student": {"table": "students", "id_col": "student_id", "role": "student"},
+    "teacher": {"table": "teachers", "id_col": "teacher_id", "role": "teacher"},
+}
 
-def _fetch_user(cursor: pymysql.cursors.Cursor, user_id: int) -> dict | None:
-    cursor.execute(
-        """
-        SELECT id, admin_id, name, phone, email, role, created_at, updated_at
-        FROM admins WHERE id = %s
-        """,
-        (user_id,),
-    )
+
+def _normalize_user_type(user_type: str | None) -> str:
+    value = (user_type or "admin").strip().lower()
+    if value not in USER_TABLES:
+        raise HTTPException(status_code=400, detail="user_type 必须为 student/teacher/admin")
+    return value
+
+
+def _fetch_user(cursor: pymysql.cursors.Cursor, user_id: int, user_type: str) -> dict | None:
+    user_type = _normalize_user_type(user_type)
+    info = USER_TABLES[user_type]
+    table = info["table"]
+    id_col = info["id_col"]
+    if user_type == "admin":
+        cursor.execute(
+            f"""
+            SELECT id, {id_col} as username, name as full_name, phone, email, role, created_at, updated_at
+            FROM {table} WHERE id = %s
+            """,
+            (user_id,),
+        )
+    else:
+        cursor.execute(
+            f"""
+            SELECT id, {id_col} as username, name as full_name, phone, email, created_at, updated_at
+            FROM {table} WHERE id = %s
+            """,
+            (user_id,),
+        )
     row = cursor.fetchone()
     if not row:
         return None
     if isinstance(row, dict):
-        return {
+        data = {
             "id": row["id"],
-            "username": row["admin_id"],
-            "phone": row["phone"],
-            "email": row["email"],
-            "full_name": row["name"],
-            "role": row["role"],
+            "username": row["username"],
+            "phone": row.get("phone"),
+            "email": row.get("email"),
+            "full_name": row.get("full_name"),
+            "role": row.get("role") if user_type == "admin" else info["role"],
             "created_at": row["created_at"] if isinstance(row["created_at"], str) else row["created_at"].strftime("%Y-%m-%d %H:%M:%S"),
             "updated_at": row["updated_at"] if isinstance(row["updated_at"], str) else row["updated_at"].strftime("%Y-%m-%d %H:%M:%S"),
         }
+        return data
     # fallback for tuple cursor
+    if user_type == "admin":
+        return {
+            "id": row[0],
+            "username": row[1],
+            "phone": row[3],
+            "email": row[4],
+            "full_name": row[2],
+            "role": row[5],
+            "created_at": row[6] if isinstance(row[6], str) else row[6].strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": row[7] if isinstance(row[7], str) else row[7].strftime("%Y-%m-%d %H:%M:%S"),
+        }
     return {
         "id": row[0],
         "username": row[1],
         "phone": row[3],
         "email": row[4],
         "full_name": row[2],
-        "role": row[5],
-        "created_at": row[6] if isinstance(row[6], str) else row[6].strftime("%Y-%m-%d %H:%M:%S"),
-        "updated_at": row[7] if isinstance(row[7], str) else row[7].strftime("%Y-%m-%d %H:%M:%S"),
+        "role": info["role"],
+        "created_at": row[5] if isinstance(row[5], str) else row[5].strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": row[6] if isinstance(row[6], str) else row[6].strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
 @router.post(
-    "/",
+    "/students",
     response_model=UserOut,
-    summary="创建用户",
-    description="创建单个用户并返回用户信息"
+    summary="创建学生",
+    description="创建学生并返回用户信息"
 )
-def create_user(payload: UserCreate, db: pymysql.connections.Connection = Depends(get_db)):
+def create_student(payload: StudentCreate, db: pymysql.connections.Connection = Depends(get_db)):
     cursor = None
     try:
         cursor = db.cursor(pymysql.cursors.DictCursor)
+        username = payload.username.strip()
+        if not username:
+            raise HTTPException(status_code=400, detail="username 不能为空")
+        full_name = payload.full_name or username
+        raw_password = payload.password or "123456"
+        password_hash = get_password_hash(raw_password)
         cursor.execute(
             """
-            INSERT INTO admins (admin_id, name, phone, email, role)
+            INSERT INTO students (student_id, name, phone, email, password)
             VALUES (%s, %s, %s, %s, %s)
             """,
+            (username, full_name, payload.phone, payload.email, password_hash),
+        )
+        db.commit()
+        user_id = cursor.lastrowid
+        cursor.execute(
+            """
+            SELECT id, student_id as username, name as full_name, phone, email,
+                   DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') as created_at,
+                   DATE_FORMAT(updated_at, '%%Y-%%m-%%d %%H:%%i:%%s') as updated_at
+            FROM students WHERE id = %s
+            """,
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=500, detail="用户创建成功但查询失败")
+        row["role"] = "student" if isinstance(row, dict) else "student"
+        return UserOut(**row)
+    except pymysql.err.IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="用户名已存在")
+    except pymysql.MySQLError as e:
+        db.rollback()
+        logger.error(f"用户创建数据库错误: {str(e)}")
+        raise HTTPException(status_code=500, detail="用户创建失败")
+    finally:
+        if cursor:
+            cursor.close()
+
+
+@router.post(
+    "/teachers",
+    response_model=UserOut,
+    summary="创建教师",
+    description="创建教师并返回用户信息"
+)
+def create_teacher(payload: TeacherCreate, db: pymysql.connections.Connection = Depends(get_db)):
+    cursor = None
+    try:
+        cursor = db.cursor(pymysql.cursors.DictCursor)
+        username = payload.username.strip()
+        if not username:
+            raise HTTPException(status_code=400, detail="username 不能为空")
+
+        full_name = payload.full_name or username
+        raw_password = payload.password or "123456"
+        password_hash = get_password_hash(raw_password)
+
+        cursor.execute(
+            """
+            INSERT INTO teachers (teacher_id, name, phone, email, password)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (username, full_name, payload.phone, payload.email, password_hash),
+        )
+        db.commit()
+        user_id = cursor.lastrowid
+        cursor.execute(
+            """
+            SELECT id, teacher_id as username, name as full_name, phone, email,
+                   DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') as created_at,
+                   DATE_FORMAT(updated_at, '%%Y-%%m-%%d %%H:%%i:%%s') as updated_at
+            FROM teachers WHERE id = %s
+            """,
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=500, detail="用户创建成功但查询失败")
+        row["role"] = "teacher" if isinstance(row, dict) else "teacher"
+        return UserOut(**row)
+    except pymysql.err.IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="用户名已存在")
+    except pymysql.MySQLError as e:
+        db.rollback()
+        logger.error(f"用户创建数据库错误: {str(e)}")
+        raise HTTPException(status_code=500, detail="用户创建失败")
+    finally:
+        if cursor:
+            cursor.close()
+
+
+@router.post(
+    "/admins",
+    response_model=UserOut,
+    summary="创建管理员",
+    description="创建管理员并返回用户信息"
+)
+def create_admin(payload: AdminCreate, db: pymysql.connections.Connection = Depends(get_db)):
+    cursor = None
+    try:
+        cursor = db.cursor(pymysql.cursors.DictCursor)
+        username = payload.username.strip()
+        if not username:
+            raise HTTPException(status_code=400, detail="username 不能为空")
+
+        full_name = payload.full_name or username
+        raw_password = payload.password or "123456"
+        password_hash = get_password_hash(raw_password)
+
+        cursor.execute(
+            """
+            INSERT INTO admins (admin_id, name, phone, email, role, password)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
             (
-                payload.username.strip(),
-                payload.full_name,
+                username,
+                full_name,
                 payload.phone,
                 payload.email,
                 payload.role or "admin",
+                password_hash,
             ),
         )
         db.commit()
@@ -114,7 +268,10 @@ def update_user(user_id: int, payload: UserUpdate, db: pymysql.connections.Conne
     cursor = None
     try:
         cursor = db.cursor(pymysql.cursors.DictCursor)
-        cursor.execute("SELECT id FROM admins WHERE id = %s", (user_id,))
+        user_type = _normalize_user_type(payload.user_type)
+        info = USER_TABLES[user_type]
+        table = info["table"]
+        cursor.execute(f"SELECT id FROM {table} WHERE id = %s", (user_id,))
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="用户不存在")
 
@@ -129,22 +286,25 @@ def update_user(user_id: int, payload: UserUpdate, db: pymysql.connections.Conne
         if payload.full_name is not None:
             fields.append("name = %s")
             params.append(payload.full_name)
-        if payload.role is not None:
+        if payload.role is not None and user_type == "admin":
             fields.append("role = %s")
             params.append(payload.role)
+        if payload.password is not None:
+            fields.append("password = %s")
+            params.append(get_password_hash(payload.password))
 
         if not fields:
-            existing = _fetch_user(cursor, user_id)
+            existing = _fetch_user(cursor, user_id, user_type)
             if not existing:
                 raise HTTPException(status_code=404, detail="用户不存在")
             return UserOut(**existing)
 
         fields.append("updated_at = NOW()")
-        sql = f"UPDATE admins SET {', '.join(fields)} WHERE id = %s"
+        sql = f"UPDATE {table} SET {', '.join(fields)} WHERE id = %s"
         params.append(user_id)
         cursor.execute(sql, tuple(params))
         db.commit()
-        updated = _fetch_user(cursor, user_id)
+        updated = _fetch_user(cursor, user_id, user_type)
         if not updated:
             raise HTTPException(status_code=500, detail="用户更新后查询失败")
         return UserOut(**updated)
@@ -164,14 +324,21 @@ def update_user(user_id: int, payload: UserUpdate, db: pymysql.connections.Conne
     summary="删除用户",
     description="根据用户ID删除用户"
 )
-def delete_user(user_id: int, db: pymysql.connections.Connection = Depends(get_db)):
+def delete_user(
+    user_id: int,
+    db: pymysql.connections.Connection = Depends(get_db),
+    user_type: str = Query("admin"),
+):
     cursor = None
     try:
         cursor = db.cursor()
-        cursor.execute("SELECT 1 FROM admins WHERE id = %s", (user_id,))
+        user_type = _normalize_user_type(user_type)
+        info = USER_TABLES[user_type]
+        table = info["table"]
+        cursor.execute(f"SELECT 1 FROM {table} WHERE id = %s", (user_id,))
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="用户不存在")
-        cursor.execute("DELETE FROM admins WHERE id = %s", (user_id,))
+        cursor.execute(f"DELETE FROM {table} WHERE id = %s", (user_id,))
         db.commit()
         return {"message": "删除成功", "user_id": user_id}
     except HTTPException:
@@ -188,7 +355,7 @@ def delete_user(user_id: int, db: pymysql.connections.Connection = Depends(get_d
 @router.post(
     "/import",
     summary="一键导入用户",
-    description="上传 CSV/TSV 文件批量导入用户（列：username,email,full_name,role 可选）"
+    description="上传 CSV/TSV 文件批量导入用户（列：username,user_type,email,full_name,role,password 可选）"
 )
 async def import_users(file: UploadFile = File(...), db: pymysql.connections.Connection = Depends(get_db)):
     filename = file.filename or ""
@@ -216,41 +383,102 @@ async def import_users(file: UploadFile = File(...), db: pymysql.connections.Con
 
     created, updated = 0, 0
     default_role = "admin"
+    default_password = "123456"
     cursor = None
+    created_items = []
+    updated_items = []
     try:
         cursor = db.cursor()
         for row in reader:
             username = (row.get("username") or "").strip()
             if not username:
                 continue
+            user_type = _normalize_user_type(row.get("user_type") or "admin")
+            info = USER_TABLES[user_type]
+            table = info["table"]
             phone = (row.get("phone") or None) and row.get("phone").strip()
             email = (row.get("email") or None) and row.get("email").strip()
             full_name = (row.get("full_name") or None) and row.get("full_name").strip()
             role = (row.get("role") or default_role).strip() or default_role
+            password = (row.get("password") or default_password).strip() or default_password
+            password_hash = get_password_hash(password)
             if not full_name:
                 full_name = username  # 默认使用username作为full_name
-            cursor.execute(
-                """
-                INSERT INTO admins (admin_id, name, phone, email, role)
-                VALUES (%s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    name = VALUES(name),
-                    phone = VALUES(phone),
-                    email = VALUES(email),
-                    role = VALUES(role),
-                    updated_at = NOW()
-                """,
-                (username, full_name, phone, email, role),
-            )
+            if user_type == "admin":
+                cursor.execute(
+                    """
+                    INSERT INTO admins (admin_id, name, phone, email, role, password)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        name = VALUES(name),
+                        phone = VALUES(phone),
+                        email = VALUES(email),
+                        role = VALUES(role),
+                        password = VALUES(password),
+                        updated_at = NOW()
+                    """,
+                    (username, full_name, phone, email, role, password_hash),
+                )
+            elif user_type == "student":
+                cursor.execute(
+                    """
+                    INSERT INTO students (student_id, name, phone, email, password)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        name = VALUES(name),
+                        phone = VALUES(phone),
+                        email = VALUES(email),
+                        password = VALUES(password),
+                        updated_at = NOW()
+                    """,
+                    (username, full_name, phone, email, password_hash),
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO teachers (teacher_id, name, phone, email, password)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        name = VALUES(name),
+                        phone = VALUES(phone),
+                        email = VALUES(email),
+                        password = VALUES(password),
+                        updated_at = NOW()
+                    """,
+                    (username, full_name, phone, email, password_hash),
+                )
             if cursor.rowcount == 1:
                 created += 1
+                # fetch id
+                cursor.execute(f"SELECT id FROM {table} WHERE {info['id_col']} = %s", (username,))
+                rid = cursor.fetchone()
+                if rid:
+                    if isinstance(rid, dict):
+                        rec_id = rid.get('id')
+                    else:
+                        rec_id = rid[0]
+                else:
+                    rec_id = None
+                created_items.append({"user_type": user_type, "username": username, "id": rec_id})
             else:
                 updated += 1
+                cursor.execute(f"SELECT id FROM {table} WHERE {info['id_col']} = %s", (username,))
+                rid = cursor.fetchone()
+                if rid:
+                    if isinstance(rid, dict):
+                        rec_id = rid.get('id')
+                    else:
+                        rec_id = rid[0]
+                else:
+                    rec_id = None
+                updated_items.append({"user_type": user_type, "username": username, "id": rec_id})
         db.commit()
         return {
             "message": "导入完成",
             "created": created,
             "updated": updated,
+            "created_items": created_items,
+            "updated_items": updated_items,
         }
     except pymysql.MySQLError as e:
         db.rollback()
@@ -267,20 +495,27 @@ async def import_users(file: UploadFile = File(...), db: pymysql.connections.Con
     summary="绑定手机号",
     description="为指定用户绑定/更新手机号"
 )
-def bind_phone(user_id: int, payload: UserBindPhone, db: pymysql.connections.Connection = Depends(get_db)):
+def bind_phone(
+    user_id: int,
+    payload: UserBindPhone,
+    db: pymysql.connections.Connection = Depends(get_db),
+    user_type: str = Query("admin"),
+):
     cursor = None
     try:
         cursor = db.cursor(pymysql.cursors.DictCursor)
-        cursor.execute("SELECT id FROM admins WHERE id = %s", (user_id,))
+        user_type = _normalize_user_type(user_type)
+        table = USER_TABLES[user_type]["table"]
+        cursor.execute(f"SELECT id FROM {table} WHERE id = %s", (user_id,))
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="用户不存在")
 
         cursor.execute(
-            "UPDATE admins SET phone = %s, updated_at = NOW() WHERE id = %s",
+            f"UPDATE {table} SET phone = %s, updated_at = NOW() WHERE id = %s",
             (payload.phone.strip(), user_id),
         )
         db.commit()
-        updated = _fetch_user(cursor, user_id)
+        updated = _fetch_user(cursor, user_id, user_type)
         if not updated:
             raise HTTPException(status_code=500, detail="手机号绑定后查询失败")
         return UserOut(**updated)
@@ -301,20 +536,27 @@ def bind_phone(user_id: int, payload: UserBindPhone, db: pymysql.connections.Con
     summary="绑定邮箱",
     description="为指定用户绑定/更新邮箱"
 )
-def bind_email(user_id: int, payload: UserBindEmail, db: pymysql.connections.Connection = Depends(get_db)):
+def bind_email(
+    user_id: int,
+    payload: UserBindEmail,
+    db: pymysql.connections.Connection = Depends(get_db),
+    user_type: str = Query("admin"),
+):
     cursor = None
     try:
         cursor = db.cursor(pymysql.cursors.DictCursor)
-        cursor.execute("SELECT id FROM admins WHERE id = %s", (user_id,))
+        user_type = _normalize_user_type(user_type)
+        table = USER_TABLES[user_type]["table"]
+        cursor.execute(f"SELECT id FROM {table} WHERE id = %s", (user_id,))
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="用户不存在")
 
         cursor.execute(
-            "UPDATE admins SET email = %s, updated_at = NOW() WHERE id = %s",
+            f"UPDATE {table} SET email = %s, updated_at = NOW() WHERE id = %s",
             (payload.email, user_id),
         )
         db.commit()
-        updated = _fetch_user(cursor, user_id)
+        updated = _fetch_user(cursor, user_id, user_type)
         if not updated:
             raise HTTPException(status_code=500, detail="邮箱绑定后查询失败")
         return UserOut(**updated)

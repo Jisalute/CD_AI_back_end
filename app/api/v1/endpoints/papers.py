@@ -1,5 +1,5 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, BackgroundTasks
-from typing import List
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, BackgroundTasks, Query
+from typing import List, Optional
 import os
 from app.core.dependencies import get_current_user
 from app.schemas.document import (
@@ -14,21 +14,39 @@ from app.services.oss import upload_file_to_oss
 from datetime import datetime
 from app.database import get_db
 import pymysql
+import json
 
 router = APIRouter()
+
+
+def _parse_current_user(current_user: Optional[str]) -> dict:
+    try:
+        if not current_user:
+            return {"sub": 0, "username": "", "roles": []}
+        import urllib.parse
+        raw = urllib.parse.unquote(current_user)
+        if not raw.strip():
+            return {"sub": 0, "username": "", "roles": []}
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {"sub": 0, "username": "", "roles": []}
 
 @router.post(
     "/upload",
     response_model=PaperOut,
     summary="上传论文",
-    description="上传 docx 生成论文记录与首个版本"
+    description="上传 docx 生成论文记录与首个版本，并记录提交者信息"
 )
 async def upload_paper(
     file: UploadFile = File(...),
     db: pymysql.connections.Connection = Depends(get_db),
+    current_user: Optional[str] = Query(None, description="提交者信息(JSON字符串，包含 sub/username/roles)"),
     # current_user=Depends(get_current_user),
 ):
-    current_user = {"sub": 1}  # 模拟“已登录”
+    current_user = _parse_current_user(current_user)
     # 验证文件扩展名
     if not file.filename.lower().endswith(".docx"):
         raise HTTPException(status_code=400, detail="仅支持 .docx 格式")
@@ -46,6 +64,9 @@ async def upload_paper(
     try:
         cursor = db.cursor()
         user_id = current_user.get("sub", 0)
+        submitter_name = current_user.get("username") or ""
+        roles = current_user.get("roles") or []
+        submitter_role = ",".join([str(r) for r in roles]) if isinstance(roles, list) else str(roles)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         version = "v1.0"
         # 插入papers主表
@@ -56,10 +77,10 @@ async def upload_paper(
         cursor.execute(paper_sql, (user_id, version, oss_key, now, now))
         paper_id = cursor.lastrowid 
         version_sql = """
-        INSERT INTO paper_versions (paper_id, version, size, created_at, status)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO paper_versions (paper_id, version, size, created_at, status, submitted_by_id, submitted_by_name, submitted_by_role)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """
-        cursor.execute(version_sql, (paper_id, version, size, now, "ok"))
+        cursor.execute(version_sql, (paper_id, version, size, now, "ok", user_id, submitter_name, submitter_role))
         db.commit()
     except pymysql.MySQLError as e:
         db.rollback() 
@@ -83,8 +104,9 @@ async def update_paper(
     file: UploadFile = File(...),
     version: str = "v2.0",
     db: pymysql.connections.Connection = Depends(get_db),
+    current_user: Optional[str] = Query(None, description="提交者信息(JSON字符串，包含 sub/username/roles)"),
 ):
-    current_user = {"sub": 1}
+    current_user = _parse_current_user(current_user)
     if not file.filename.lower().endswith(".docx"):
         raise HTTPException(status_code=400, detail="仅支持 .docx 格式")
     contents = await file.read()
@@ -106,6 +128,9 @@ async def update_paper(
 
         oss_key = upload_file_to_oss(file.filename, contents)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        submitter_name = current_user.get("username") or ""
+        roles = current_user.get("roles") or []
+        submitter_role = ",".join([str(r) for r in roles]) if isinstance(roles, list) else str(roles)
 
         cursor.execute(
             """
@@ -117,10 +142,10 @@ async def update_paper(
         )
         cursor.execute(
             """
-            INSERT INTO paper_versions (paper_id, version, size, created_at, updated_at, status)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO paper_versions (paper_id, version, size, created_at, updated_at, status, submitted_by_id, submitted_by_name, submitted_by_role)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
-            (paper_id, version, size, now, now, "ok"),
+            (paper_id, version, size, now, now, "ok", current_user.get("sub", 0), submitter_name, submitter_role),
         )
         db.commit()
         return PaperOut(id=paper_id, owner_id=current_user.get("sub", 0), latest_version=version, oss_key=oss_key)
