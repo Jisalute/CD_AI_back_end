@@ -32,10 +32,9 @@ class Settings(BaseSettings):
     DATABASE_URL: str | None = None
     MYSQL_HOST: str = "127.0.0.1"
     MYSQL_PORT: int = 3306
-    MYSQL_USER: str = "root"
-    MYSQL_PASSWORD: str = "sbtwsj1002"
-    MYSQL_DATABASE: str = "cd_ai_db"
-
+    MYSQL_USER: str 
+    MYSQL_PASSWORD: str 
+    MYSQL_DATABASE: str
     # Auth
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     SECRET_KEY: SecretStr = SecretStr("change-me")

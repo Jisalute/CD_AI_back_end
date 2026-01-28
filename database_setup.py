@@ -1,10 +1,31 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Dict
 from urllib.parse import parse_qs, urlparse
 
 import pymysql
+
+
+def _load_dotenv(env_path: str = ".env") -> None:
+    """Load key=value pairs from .env into environment if not already set."""
+    path = Path(env_path)
+    if not path.is_file():
+        return
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv()
 
 
 def parse_mysql_url(url: str) -> Dict:
