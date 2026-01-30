@@ -3,6 +3,7 @@ from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query
 import pymysql
 from app.database import get_db
 from app.schemas.document import MaterialResponse
+from app.services.oss import upload_attachment_to_storage
 import os
 
 router = APIRouter()
@@ -31,10 +32,10 @@ async def upload_material(
         raise HTTPException(status_code=400, detail="文件名不能为空")
     if not name:
         raise HTTPException(status_code=400, detail="作者/上传者姓名不能为空")
-    # 验证文件非空
+    # 读取文件内容
     try:
-        file_content_check = await file.read(1)
-        if not file_content_check:
+        content = await file.read()
+        if not content:
             raise HTTPException(status_code=400, detail="上传的文件内容不能为空")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"读取文件失败：{str(e)}")
@@ -51,7 +52,7 @@ async def upload_material(
             )
             VALUES (%s, %s, NOW(), %s, %s, %s, %s, NOW(), NOW())
         """
-        storage_path = "no_local_storage"
+        storage_path = upload_attachment_to_storage(file.filename, content)
         # 执行插入
         cursor.execute(
             insert_sql,
@@ -110,10 +111,10 @@ async def update_material(
     # 基础文件参数校验
     if not file.filename:
         raise HTTPException(status_code=400, detail="上传的文件必须包含文件名")
-    # 验证文件非空
+    # 读取文件内容
     try:
-        file_content_check = await file.read(1)
-        if not file_content_check:
+        content = await file.read()
+        if not content:
             raise HTTPException(status_code=400, detail="上传的文件内容不能为空")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"读取上传文件失败：{str(e)}")
@@ -132,7 +133,7 @@ async def update_material(
         update_params.append(file.filename)
         update_fields.append("upload_time = NOW()")
         update_fields.append("storage_path = %s")
-        update_params.append("no_local_storage")
+        update_params.append(upload_attachment_to_storage(file.filename, content))
         # 可选更新字段
         if name is not None:
             update_fields.append("name = %s")

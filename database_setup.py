@@ -158,7 +158,7 @@ CREATE TABLE IF NOT EXISTS `group_members` (
     `group_id` VARCHAR(64) NOT NULL COMMENT '群组编号',
     `member_id` BIGINT UNSIGNED NOT NULL COMMENT '成员ID',
     `member_type` ENUM('student', 'teacher', 'admin') NOT NULL COMMENT '成员类型',
-    `role` ENUM('member', 'admin') NOT NULL DEFAULT 'member' COMMENT '角色：member普通成员, admin管理员',
+    `role` ENUM('member', 'admin', 'owner') NOT NULL DEFAULT 'member' COMMENT '角色：member普通成员, admin管理员, owner群主',
     `joined_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '加入时间',
     `is_active` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否有效（用于软删除）',
     `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
@@ -194,6 +194,9 @@ CREATE TABLE IF NOT EXISTS `paper_versions` (
     `created_at` DATETIME NOT NULL COMMENT '创建时间',
     `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     `status` VARCHAR(20) NOT NULL COMMENT '状态（如uploaded, processing, completed等）',
+    `submitted_by_id` BIGINT UNSIGNED DEFAULT NULL COMMENT '提交者ID',
+    `submitted_by_name` VARCHAR(128) DEFAULT NULL COMMENT '提交者姓名',
+    `submitted_by_role` VARCHAR(64) DEFAULT NULL COMMENT '提交者角色',
     PRIMARY KEY (`id`),
     KEY `idx_paper_id` (`paper_id`),
     KEY `idx_version` (`version`),
@@ -417,7 +420,7 @@ TABLE_COLUMN_DEFINITIONS = {
         "group_id": "`group_id` VARCHAR(64) NOT NULL COMMENT '群组编号'",
         "member_id": "`member_id` BIGINT UNSIGNED NOT NULL COMMENT '成员ID'",
         "member_type": "`member_type` ENUM('student', 'teacher', 'admin') NOT NULL COMMENT '成员类型'",
-        "role": "`role` ENUM('member', 'admin') NOT NULL DEFAULT 'member' COMMENT '角色：member普通成员, admin管理员'",
+        "role": "`role` ENUM('member', 'admin', 'owner') NOT NULL DEFAULT 'member' COMMENT '角色：member普通成员, admin管理员, owner群主'",
         "joined_at": "`joined_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '加入时间'",
         "is_active": "`is_active` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否有效（用于软删除）'",
         "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间'",
@@ -439,6 +442,9 @@ TABLE_COLUMN_DEFINITIONS = {
         "created_at": "`created_at` DATETIME NOT NULL COMMENT '创建时间'",
         "updated_at": "`updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'",
         "status": "`status` VARCHAR(20) NOT NULL COMMENT '状态（如uploaded, processing, completed等）'",
+        "submitted_by_id": "`submitted_by_id` BIGINT UNSIGNED DEFAULT NULL COMMENT '提交者ID'",
+        "submitted_by_name": "`submitted_by_name` VARCHAR(128) DEFAULT NULL COMMENT '提交者姓名'",
+        "submitted_by_role": "`submitted_by_role` VARCHAR(64) DEFAULT NULL COMMENT '提交者角色'",
     },
     "paper_status_records": {
         "id": "`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY",
@@ -610,6 +616,25 @@ def sync_schema(database_url: str | None = None) -> None:
                     stmt = f"ALTER TABLE `{table}` ADD COLUMN {col_def};"
                     with conn.cursor() as cur:
                         cur.execute(stmt)
+
+        # Ensure enum definition for group_members.role includes owner
+        with conn.cursor() as cur:
+            cur.execute(
+                "SHOW COLUMNS FROM `group_members` LIKE 'role'"
+            )
+            row = cur.fetchone()
+            role_type = None
+            if row:
+                # row can be tuple or dict
+                if isinstance(row, dict):
+                    role_type = row.get("Type") or row.get("type")
+                else:
+                    # SHOW COLUMNS returns: Field, Type, Null, Key, Default, Extra
+                    role_type = row[1] if len(row) > 1 else None
+            if role_type and "enum" in role_type.lower() and "owner" not in role_type.lower():
+                cur.execute(
+                    "ALTER TABLE `group_members` MODIFY COLUMN `role` ENUM('member','admin','owner') NOT NULL DEFAULT 'member'"
+                )
 
         # Ensure indexes
         for table, idx_list in TABLE_INDEX_DEFINITIONS.items():
