@@ -36,11 +36,25 @@ def push_notification(
         
         # 2. 安全获取可选字段（兼容模型中有无这些字段的情况）
         # 使用 getattr 安全访问，避免 AttributeError
-        metadata = getattr(payload, "metadata", None)
+        metadata = getattr(payload, "metadata", None) or {}
         source = getattr(payload, "source", None)
         target_username = getattr(payload, "target_username", None)
+        sender_id = getattr(payload, "sender_id", None)
         
         # 处理JSON字段
+        # 如果 content 超过 TEXT 大小（防护），将超长部分保存到 metadata.long_content
+        # MySQL TEXT 上限约 65535 字节，使用 60000 作为安全阈值
+        content_value = payload.content or ""
+        if len(content_value) > 60000:
+            metadata = metadata or {}
+            metadata["long_content"] = content_value[60000:]
+            content_value = content_value[:60000]
+
+        # 将 sender_id 保存到 metadata，便于后续查询与绑定
+        if sender_id is not None:
+            metadata = metadata or {}
+            metadata["sender_id"] = str(sender_id)
+
         metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
         # 处理source默认值
         source_value = source or "system"
@@ -62,11 +76,11 @@ def push_notification(
                 payload.target_user_id,  # user_id（接收用户ID）
                 username_value,          # username（接收用户名，可为空）
                 payload.title,           # title（消息标题）
-                payload.content,         # content（消息内容）
+                content_value,           # content（消息内容，已按长度保护）
                 source_value,            # source（来源，默认system）
-                "unread",                # status（默认未读）
+                "unread",               # status（默认未读）
                 now_str,                 # received_time（接收时间）
-                metadata_json,           # metadata（扩展元数据，可为空）
+                metadata_json,           # metadata（扩展元数据，可为空，含 sender_id 或 long_content）
                 now_str,                 # created_at（记录创建时间）
                 now_str                  # updated_at（记录更新时间）
             ),
