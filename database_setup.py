@@ -175,12 +175,14 @@ PAPERS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS `papers` (
     `id` INT NOT NULL AUTO_INCREMENT COMMENT '论文ID',
     `owner_id` INT NOT NULL COMMENT '所有者ID',
+    `teacher_id` INT NOT NULL COMMENT '老师ID', 
     `latest_version` VARCHAR(20) NOT NULL COMMENT '最新版本号',
     `oss_key` VARCHAR(255) NOT NULL COMMENT 'OSS存储键',
     `created_at` DATETIME NOT NULL COMMENT '创建时间',
     `updated_at` DATETIME NOT NULL COMMENT '更新时间',
     PRIMARY KEY (`id`),
-    KEY `idx_owner_id` (`owner_id`)
+    KEY `idx_owner_id` (`owner_id`),
+    KEY `idx_teacher_id` (`teacher_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='论文基础信息表';
 """
 
@@ -189,6 +191,7 @@ PAPER_VERSIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS `paper_versions` (
     `id` INT NOT NULL AUTO_INCREMENT COMMENT '版本记录ID',
     `paper_id` INT NOT NULL COMMENT '所属论文ID',
+    `teacher_id` INT NOT NULL COMMENT '老师ID', 
     `version` VARCHAR(20) NOT NULL COMMENT '版本号',
     `size` INT NOT NULL COMMENT '文件大小（字节）',
     `created_at` DATETIME NOT NULL COMMENT '创建时间',
@@ -200,6 +203,7 @@ CREATE TABLE IF NOT EXISTS `paper_versions` (
     PRIMARY KEY (`id`),
     KEY `idx_paper_id` (`paper_id`),
     KEY `idx_version` (`version`),
+    KEY `idx_teacher_id` (`teacher_id`),
     CONSTRAINT `fk_paper_versions_paper_id` FOREIGN KEY (`paper_id`) REFERENCES `papers` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='论文版本信息表';
 """
