@@ -70,14 +70,24 @@ uv sync
 uv pip install email-validator
 ```
 
-### 3) 配置环境变量（必需）
+### 3) 配置环境变量（推荐）
 
-本项目运行期需配置 `DATABASE_URL`，否则会报错。可在系统环境或 `.env` 中设置。
+支持两种方式配置数据库连接（系统环境或 `.env`）：
 
-示例（MySQL 连接串）：
+1) 直接提供 `DATABASE_URL`
 
 ```
 DATABASE_URL=mysql+pymysql://user:password@127.0.0.1:3306/cd_ai_db?charset=utf8mb4
+```
+
+2) 使用分项配置（未提供 `DATABASE_URL` 时会自动拼接）
+
+```
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=your_password
+MYSQL_DATABASE=cd_ai_db
 ```
 
 ### 4) 初始化/同步数据库表结构
@@ -109,17 +119,20 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 ## 主要接口概览（/api/v1）
 
-- 材料 Materials（存储与路径读取）
+- 材料 Materials（上传与查询）
 	- POST `/materials/upload`
 	- PUT `/materials/{material_id}`
 	- DELETE `/materials/{material_id}`
-	- GET `/materials/names?path=...`（列出指定目录下文件名，非递归）
+	- GET `/materials/names`（支持 `name`/`file_type`/`keyword` 过滤）
 
 - 论文 Papers（上传与版本）
 	- POST `/papers/upload`
 	- PUT `/papers/{paper_id}`（上传新版本并更新最新版本）
 	- DELETE `/papers/{paper_id}`
+	- GET `/papers/{paper_id}/download`（下载最新版本）
 	- GET `/papers/{paper_id}/versions`
+	- GET `/papers/groups`（查看群组论文列表）
+	- POST `/papers/download/batch`（批量下载论文，接受论文ID列表并返回压缩包）
 	- POST `/papers/{paper_id}/versions/{version}/status`（创建论文版本状态）
 	- PUT  `/papers/{paper_id}/versions/{version}/status`（更新论文版本状态）
 
@@ -129,6 +142,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 - 群组 Groups（导入与成员管理）
 	- POST `/groups/import`（批量导入 TSV/CSV）
+	- GET  `/groups/`（分页获取群组列表，支持关键词/教师工号筛选）
 	- POST `/groups/create`
 	- DELETE `/groups/{group_id}`
 	- POST `/groups/{group_id}/members`
@@ -136,11 +150,18 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 - 标注 Annotations
 	- POST `/annotations/`（为论文创建标注）
+	- PUT `/annotations/{annotation_id}`（更新标注）
+	- DELETE `/annotations/{annotation_id}`（删除标注）
 
 - 管理 Admin
 	- POST `/admin/templates`（上传模板并存储元数据）
 	- PUT  `/admin/templates/{template_id}`
 	- DELETE `/admin/templates/{template_id}`
+	- POST `/admin/ddls`（创建 DDL）
+	- GET `/admin/ddls`（查看 DDL 列表）
+	- GET `/admin/ddls/{ddl_id}`（查看 DDL）
+	- PUT `/admin/ddls/{ddl_id}`（更新 DDL）
+	- DELETE `/admin/ddls/{ddl_id}`（删除 DDL）
 	- GET  `/admin/dashboard/stats`
 	- GET  `/admin/audit/logs`
 
@@ -153,12 +174,15 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 	- PUT  `/users/{user_id}`（更新用户信息）
 	- DELETE `/users/{user_id}`（删除用户）
 	- POST `/users/import`（一键导入用户，CSV/TSV）
-		- 导入文件列支持：username（必填）、email、full_name、role、password（可选；未提供则使用默认密码）
+		- 导入文件列支持：username（必填）、phone、email、full_name、role
+	- PUT  `/users/{user_id}/bind-phone`（绑定/更新手机号）
+	- PUT  `/users/{user_id}/bind-email`（绑定/更新邮箱）
+	- POST `/users/{user_id}/bind-group`（绑定群组）
 
-## 注意事项
+## 注意事项 
 
 - 认证与权限：当前部分接口使用模拟用户，实际接入请启用 [app/core/dependencies.py](app/core/dependencies.py) 与 [app/core/security.py](app/core/security.py)。
-- 数据库：运行前必须正确配置 `DATABASE_URL`，并执行一次 `python database_setup.py` 创建/同步表结构。
+- 数据库：可配置 `DATABASE_URL` 或 `MYSQL_*`，并执行一次 `python database_setup.py` 创建/同步表结构。
 - 用户表：`database_setup.py` 会创建 `users` 表；导入/创建用户前请先执行初始化脚本。
 - 依赖：如使用 EmailStr 字段，需安装 `email-validator`，否则应用启动会报缺失模块错误。
 - 代理/网络：如通过反向代理访问，请确保 `/docs`、`/openapi.json` 可正常透传。

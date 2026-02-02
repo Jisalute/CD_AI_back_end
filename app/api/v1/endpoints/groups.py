@@ -31,6 +31,88 @@ class GroupMember(BaseModel):
     role: str = "member"  # 成员 member / 管理员 admin
 
 
+@router.get(
+    "/",
+    summary="获取群组列表",
+    description="分页查询群组列表，支持关键词与教师工号筛选"
+)
+def list_groups(
+    keyword: str | None = Query(None, description="群组编号/名称关键词"),
+    teacher_id: str | None = Query(None, description="按教师工号筛选"),
+    page: int = Query(1, ge=1, description="页码（从1开始）"),
+    page_size: int = Query(20, ge=1, le=100, description="每页条数（1-100）"),
+):
+    conn = get_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        where_sql = "WHERE 1=1"
+        params: list = []
+        if keyword:
+            where_sql += " AND (group_id LIKE %s OR group_name LIKE %s)"
+            like_value = f"%{keyword}%"
+            params.extend([like_value, like_value])
+        if teacher_id:
+            where_sql += " AND teacher_id = %s"
+            params.append(teacher_id)
+
+        count_sql = f"SELECT COUNT(*) as total FROM `groups` {where_sql}"
+        cursor.execute(count_sql, tuple(params))
+        total = cursor.fetchone()["total"]
+
+        offset = (page - 1) * page_size
+        list_sql = f"""
+        SELECT
+            g.id,
+            g.group_id,
+            g.group_name,
+            g.teacher_id,
+            g.description,
+            g.created_at,
+            g.updated_at,
+            (
+                SELECT COUNT(*)
+                FROM `group_members` gm
+                WHERE gm.group_id = g.group_id AND gm.is_active = 1
+            ) AS member_count
+        FROM `groups` g
+        {where_sql}
+        ORDER BY g.created_at DESC
+        LIMIT %s OFFSET %s
+        """
+        cursor.execute(list_sql, tuple(params + [page_size, offset]))
+        rows = cursor.fetchall()
+
+        items = []
+        for row in rows:
+            items.append(
+                {
+                    "id": row["id"],
+                    "group_id": row["group_id"],
+                    "group_name": row["group_name"],
+                    "teacher_id": row["teacher_id"],
+                    "description": row["description"],
+                    "member_count": row["member_count"],
+                    "created_at": row["created_at"].strftime("%Y-%m-%d %H:%M:%S") if row["created_at"] else None,
+                    "updated_at": row["updated_at"].strftime("%Y-%m-%d %H:%M:%S") if row["updated_at"] else None,
+                }
+            )
+
+        return {
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": (total + page_size - 1) // page_size,
+        }
+    except pymysql.MySQLError as e:
+        raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
 @router.post(
     "/import",
     summary="导入群组与师生关系",

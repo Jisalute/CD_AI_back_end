@@ -1,6 +1,8 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from typing import List
 import os
+import io
 from app.core.dependencies import get_current_user
 from app.schemas.document import (
     PaperCreate,
@@ -10,7 +12,7 @@ from app.schemas.document import (
     PaperStatusUpdate,
     VersionOut,
 )
-from app.services.oss import upload_file_to_oss
+from app.services.oss import upload_file_to_oss, get_file_from_oss
 from datetime import datetime
 from app.database import get_db
 import pymysql
@@ -330,3 +332,52 @@ def list_versions(
             cursor.close()
         db.close()
     return [VersionOut(version="v1.0", size=12345, created_at="2025-01-01T00:00:00Z", status="正常")]
+
+
+@router.get(
+    "/{paper_id}/download",
+    summary="下载论文",
+    description="下载论文最新版本文件"
+)
+def download_paper(
+    paper_id: int,
+    db: pymysql.connections.Connection = Depends(get_db),
+):
+    current_user = {"sub": 1}
+    cursor = None
+    try:
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT owner_id, latest_version, oss_key FROM papers WHERE id = %s",
+            (paper_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="论文不存在")
+        if row[0] != current_user.get("sub"):
+            raise HTTPException(status_code=403, detail="无权限下载该论文")
+        oss_key = row[2]
+        if not oss_key:
+            raise HTTPException(status_code=404, detail="论文文件不存在")
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        raise HTTPException(status_code=500, detail=f"数据库查询失败: {str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        db.close()
+
+    try:
+        filename, content = get_file_from_oss(oss_key)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="论文文件不存在或已清理")
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"'
+    }
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/octet-stream",
+        headers=headers,
+    )

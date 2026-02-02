@@ -5,6 +5,7 @@ import csv
 import io
 import pymysql
 from typing import List
+from pydantic import BaseModel
 from app.schemas.user import (
     UserCreate,
     UserUpdate,
@@ -17,6 +18,11 @@ from loguru import logger
 
 router = APIRouter()
 SUPPORTED_IMPORT_EXTS = (".csv", ".tsv")
+
+
+class UserBindGroup(BaseModel):
+    group_id: str
+    role: str = "member"
 
 
 def _fetch_user(cursor: pymysql.cursors.Cursor, user_id: int) -> dict | None:
@@ -324,6 +330,53 @@ def bind_email(user_id: int, payload: UserBindEmail, db: pymysql.connections.Con
         db.rollback()
         logger.error(f"绑定邮箱数据库错误: {str(e)}")
         raise HTTPException(status_code=500, detail="绑定邮箱失败")
+    finally:
+        if cursor:
+            cursor.close()
+
+
+@router.post(
+    "/{user_id}/bind-group",
+    summary="绑定群组",
+    description="将用户绑定到指定群组（写入 group_members）"
+)
+def bind_group(user_id: int, payload: UserBindGroup, db: pymysql.connections.Connection = Depends(get_db)):
+    if payload.role not in ["member", "admin"]:
+        raise HTTPException(status_code=400, detail="角色必须是member或admin")
+
+    cursor = None
+    try:
+        cursor = db.cursor()
+        cursor.execute("SELECT 1 FROM admins WHERE id = %s", (user_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="用户不存在")
+
+        cursor.execute("SELECT 1 FROM `groups` WHERE `group_id` = %s", (payload.group_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="群组不存在")
+
+        cursor.execute(
+            """
+            INSERT INTO `group_members` (`group_id`, `member_id`, `member_type`, `role`)
+            VALUES (%s, %s, 'admin', %s)
+            ON DUPLICATE KEY UPDATE `is_active` = 1, `role` = VALUES(`role`)
+            """,
+            (payload.group_id, user_id, payload.role),
+        )
+        db.commit()
+        return {
+            "user_id": user_id,
+            "group_id": payload.group_id,
+            "member_type": "admin",
+            "role": payload.role,
+            "message": "绑定成功",
+        }
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        db.rollback()
+        logger.error(f"绑定群组数据库错误: {str(e)}")
+        raise HTTPException(status_code=500, detail="绑定群组失败")
     finally:
         if cursor:
             cursor.close()
