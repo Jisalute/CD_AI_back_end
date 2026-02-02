@@ -3,7 +3,10 @@ from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query
 import pymysql
 from app.database import get_db
 from app.schemas.document import MaterialResponse
+from app.services.oss import upload_attachment_to_storage
 import os
+import json
+from datetime import datetime
 
 router = APIRouter()
 
@@ -17,6 +20,7 @@ router = APIRouter()
 async def upload_material(
     file: UploadFile = File(...),  
     name: str = Query(..., description="作者/上传者姓名（必填）"),
+    submitter_id: int = Query(..., description="提交人ID，用于将文件与用户/论文绑定（必填）"),
     file_type: str = Query(
         "document", 
         description="文件类型，可选值：document(文档)、essay(文章)",
@@ -31,10 +35,10 @@ async def upload_material(
         raise HTTPException(status_code=400, detail="文件名不能为空")
     if not name:
         raise HTTPException(status_code=400, detail="作者/上传者姓名不能为空")
-    # 验证文件非空
+    # 读取文件内容
     try:
-        file_content_check = await file.read(1)
-        if not file_content_check:
+        content = await file.read()
+        if not content:
             raise HTTPException(status_code=400, detail="上传的文件内容不能为空")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"读取文件失败：{str(e)}")
@@ -51,7 +55,9 @@ async def upload_material(
             )
             VALUES (%s, %s, NOW(), %s, %s, %s, %s, NOW(), NOW())
         """
-        storage_path = "no_local_storage"
+        storage_path = upload_attachment_to_storage(file.filename, content)
+        # 将提交人ID与备注一起保存到 remark 字段，使用 JSON 格式，便于后续解析绑定
+        remark_value = json.dumps({"submitter_id": submitter_id, "remark": remark})
         # 执行插入
         cursor.execute(
             insert_sql,
@@ -61,7 +67,7 @@ async def upload_material(
                 storage_path,    # 存储路径（标识值）
                 file_type,       # 文件类型
                 version,         # 版本号
-                remark           # 备注
+                remark_value     # 备注（包含 submitter_id 的 JSON）
             )
         )
         # 获取新增记录ID
@@ -80,6 +86,11 @@ async def upload_material(
         new_record = cursor.fetchone()
         if not new_record:
             raise HTTPException(status_code=500, detail="文件上传成功，但查询不到新增记录")
+        # 将上传文件的 content_type 加入返回记录（不修改数据库）
+        try:
+            new_record["content_type"] = file.content_type
+        except Exception:
+            new_record["content_type"] = None
         # 返回结果
         return new_record
     except pymysql.MySQLError as e:
@@ -110,10 +121,10 @@ async def update_material(
     # 基础文件参数校验
     if not file.filename:
         raise HTTPException(status_code=400, detail="上传的文件必须包含文件名")
-    # 验证文件非空
+    # 读取文件内容
     try:
-        file_content_check = await file.read(1)
-        if not file_content_check:
+        content = await file.read()
+        if not content:
             raise HTTPException(status_code=400, detail="上传的文件内容不能为空")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"读取上传文件失败：{str(e)}")
@@ -132,7 +143,7 @@ async def update_material(
         update_params.append(file.filename)
         update_fields.append("upload_time = NOW()")
         update_fields.append("storage_path = %s")
-        update_params.append("no_local_storage")
+        update_params.append(upload_attachment_to_storage(file.filename, content))
         # 可选更新字段
         if name is not None:
             update_fields.append("name = %s")
@@ -170,6 +181,13 @@ async def update_material(
             (material_id,),
         )
         row = cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=500, detail="更新成功但查询不到记录")
+        # 将上传文件的 content_type 加入返回数据（不修改数据库）
+        try:
+            row["content_type"] = file.content_type
+        except Exception:
+            row["content_type"] = None
         return MaterialResponse(**row)
     except pymysql.MySQLError as e:
         db.rollback()

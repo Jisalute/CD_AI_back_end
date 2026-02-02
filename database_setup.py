@@ -1,10 +1,31 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Dict
 from urllib.parse import parse_qs, urlparse
 
 import pymysql
+
+
+def _load_dotenv(env_path: str = ".env") -> None:
+    """Load key=value pairs from .env into environment if not already set."""
+    path = Path(env_path)
+    if not path.is_file():
+        return
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv()
 
 
 def parse_mysql_url(url: str) -> Dict:
@@ -137,7 +158,7 @@ CREATE TABLE IF NOT EXISTS `group_members` (
     `group_id` VARCHAR(64) NOT NULL COMMENT '群组编号',
     `member_id` BIGINT UNSIGNED NOT NULL COMMENT '成员ID',
     `member_type` ENUM('student', 'teacher', 'admin') NOT NULL COMMENT '成员类型',
-    `role` ENUM('member', 'admin') NOT NULL DEFAULT 'member' COMMENT '角色：member普通成员, admin管理员',
+    `role` ENUM('member', 'admin', 'owner') NOT NULL DEFAULT 'member' COMMENT '角色：member普通成员, admin管理员, owner群主',
     `joined_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '加入时间',
     `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     `status` VARCHAR(32) NOT NULL COMMENT '状态（如uploaded, processing, completed等）',
@@ -150,18 +171,42 @@ CREATE TABLE IF NOT EXISTS `group_members` (
     CONSTRAINT `fk_paper_versions_paper_id` FOREIGN KEY (`paper_id`) REFERENCES `papers` (`id`) ON DELETE CASCADE
     KEY `idx_group_id` (`group_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='群组成员关系表';
+"""
+
+
+PAPERS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS `papers` (
+    `id` INT NOT NULL AUTO_INCREMENT COMMENT '论文ID',
+    `owner_id` INT NOT NULL COMMENT '所有者ID',
+    `teacher_id` INT NOT NULL COMMENT '老师ID', 
+    `latest_version` VARCHAR(20) NOT NULL COMMENT '最新版本号',
+    `oss_key` VARCHAR(255) NOT NULL COMMENT 'OSS存储键',
+    `created_at` DATETIME NOT NULL COMMENT '创建时间',
+    `updated_at` DATETIME NOT NULL COMMENT '更新时间',
+    PRIMARY KEY (`id`),
+    KEY `idx_owner_id` (`owner_id`),
+    KEY `idx_teacher_id` (`teacher_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='论文基础信息表';
+"""
+
+
 PAPER_VERSIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS `paper_versions` (
     `id` INT NOT NULL AUTO_INCREMENT COMMENT '版本记录ID',
     `paper_id` INT NOT NULL COMMENT '所属论文ID',
+    `teacher_id` INT NOT NULL COMMENT '老师ID', 
     `version` VARCHAR(20) NOT NULL COMMENT '版本号',
     `size` INT NOT NULL COMMENT '文件大小（字节）',
     `created_at` DATETIME NOT NULL COMMENT '创建时间',
     `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     `status` VARCHAR(20) NOT NULL COMMENT '状态（如uploaded, processing, completed等）',
+    `submitted_by_id` BIGINT UNSIGNED DEFAULT NULL COMMENT '提交者ID',
+    `submitted_by_name` VARCHAR(128) DEFAULT NULL COMMENT '提交者姓名',
+    `submitted_by_role` VARCHAR(64) DEFAULT NULL COMMENT '提交者角色',
     PRIMARY KEY (`id`),
     KEY `idx_paper_id` (`paper_id`),
     KEY `idx_version` (`version`),
+    KEY `idx_teacher_id` (`teacher_id`),
     CONSTRAINT `fk_paper_versions_paper_id` FOREIGN KEY (`paper_id`) REFERENCES `papers` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='论文版本信息表';
 """
@@ -381,7 +426,7 @@ TABLE_COLUMN_DEFINITIONS = {
         "group_id": "`group_id` VARCHAR(64) NOT NULL COMMENT '群组编号'",
         "member_id": "`member_id` BIGINT UNSIGNED NOT NULL COMMENT '成员ID'",
         "member_type": "`member_type` ENUM('student', 'teacher', 'admin') NOT NULL COMMENT '成员类型'",
-        "role": "`role` ENUM('member', 'admin') NOT NULL DEFAULT 'member' COMMENT '角色：member普通成员, admin管理员'",
+        "role": "`role` ENUM('member', 'admin', 'owner') NOT NULL DEFAULT 'member' COMMENT '角色：member普通成员, admin管理员, owner群主'",
         "joined_at": "`joined_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '加入时间'",
         "is_active": "`is_active` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否有效（用于软删除）'",
         "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间'",
@@ -403,8 +448,17 @@ TABLE_COLUMN_DEFINITIONS = {
         "size": "`size` INT NOT NULL COMMENT '文件大小（字节）'",
         "created_at": "`created_at` DATETIME NOT NULL COMMENT '创建时间'",
         "updated_at": "`updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'",
-        "status": "`status` VARCHAR(32) NOT NULL COMMENT '状态（如uploaded, processing, completed等）'",
-        "detail": "`detail` TEXT COMMENT '状态描述/详情'",
+        "status": "`status` VARCHAR(20) NOT NULL COMMENT '状态（如uploaded, processing, completed等）'",
+        "submitted_by_id": "`submitted_by_id` BIGINT UNSIGNED DEFAULT NULL COMMENT '提交者ID'",
+        "submitted_by_name": "`submitted_by_name` VARCHAR(128) DEFAULT NULL COMMENT '提交者姓名'",
+        "submitted_by_role": "`submitted_by_role` VARCHAR(64) DEFAULT NULL COMMENT '提交者角色'",
+    },
+    "paper_status_records": {
+        "id": "`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY",
+        "paper_id": "`paper_id` INT NOT NULL COMMENT '论文ID'",
+        "version": "`version` VARCHAR(20) NOT NULL COMMENT '版本号'",
+        "status": "`status` VARCHAR(32) NOT NULL COMMENT '状态值'",
+        "detail": "`detail` TEXT COMMENT '状态描述'",
         "operated_by": "`operated_by` VARCHAR(64) DEFAULT NULL COMMENT '操作人'",
         "operated_time": "`operated_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '操作时间'",
     },
@@ -564,6 +618,25 @@ def sync_schema(database_url: str | None = None) -> None:
                     stmt = f"ALTER TABLE `{table}` ADD COLUMN {col_def};"
                     with conn.cursor() as cur:
                         cur.execute(stmt)
+
+        # Ensure enum definition for group_members.role includes owner
+        with conn.cursor() as cur:
+            cur.execute(
+                "SHOW COLUMNS FROM `group_members` LIKE 'role'"
+            )
+            row = cur.fetchone()
+            role_type = None
+            if row:
+                # row can be tuple or dict
+                if isinstance(row, dict):
+                    role_type = row.get("Type") or row.get("type")
+                else:
+                    # SHOW COLUMNS returns: Field, Type, Null, Key, Default, Extra
+                    role_type = row[1] if len(row) > 1 else None
+            if role_type and "enum" in role_type.lower() and "owner" not in role_type.lower():
+                cur.execute(
+                    "ALTER TABLE `group_members` MODIFY COLUMN `role` ENUM('member','admin','owner') NOT NULL DEFAULT 'member'"
+                )
 
         # Ensure indexes
         for table, idx_list in TABLE_INDEX_DEFINITIONS.items():

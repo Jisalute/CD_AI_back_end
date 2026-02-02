@@ -1,4 +1,6 @@
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
+from fastapi.responses import FileResponse
+from pathlib import Path
 from app.core.dependencies import get_current_user
 from app.services.oss import upload_file_to_oss
 import pymysql
@@ -76,7 +78,7 @@ async def upload_template(
         )
     finally:
         cursor.close()
-    return {"template_id": template_id, "oss_key": key}
+    return {"template_id": template_id, "oss_key": key, "storage_path": key}
 
 
 @router.put(
@@ -91,15 +93,23 @@ async def update_template(
     db: pymysql.connections.Connection = Depends(get_db)
 ):
     content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="上传文件为空")
     key = upload_file_to_oss(file.filename, content)
     upload_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     cursor = None
+    old_key = None
     try:
         cursor = db.cursor()
-        cursor.execute("SELECT id FROM templates WHERE template_id = %s", (template_id,))
-        if not cursor.fetchone():
+        cursor.execute("SELECT id, oss_key FROM templates WHERE template_id = %s", (template_id,))
+        row = cursor.fetchone()
+        if not row:
             raise HTTPException(status_code=404, detail="模板不存在")
+        if isinstance(row, dict):
+            old_key = row.get("oss_key")
+        else:
+            old_key = row[1] if len(row) > 1 else None
 
         update_sql = """
         UPDATE templates
@@ -122,15 +132,23 @@ async def update_template(
             ),
         )
         db.commit()
+        if old_key:
+            old_path = Path(old_key)
+            if old_path.is_file():
+                old_path.unlink(missing_ok=True)
         return {
             "template_id": template_id,
             "oss_key": key,
+            "storage_path": key,
             "filename": file.filename,
             "content_type": file.content_type,
             "upload_time": upload_time,
         }
     except pymysql.MySQLError as e:
         db.rollback()
+        new_path = Path(key)
+        if new_path.is_file():
+            new_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"模板更新失败：{str(e)}")
     finally:
         if cursor:
@@ -148,18 +166,79 @@ def delete_template(
     db: pymysql.connections.Connection = Depends(get_db)
 ):
     cursor = None
+    file_path = None
     try:
         cursor = db.cursor()
-        cursor.execute("SELECT id FROM templates WHERE template_id = %s", (template_id,))
-        if not cursor.fetchone():
+        cursor.execute("SELECT id, oss_key FROM templates WHERE template_id = %s", (template_id,))
+        row = cursor.fetchone()
+        if not row:
             raise HTTPException(status_code=404, detail="模板不存在")
+        if isinstance(row, dict):
+            file_path = row.get("oss_key")
+        else:
+            file_path = row[1] if len(row) > 1 else None
 
         cursor.execute("DELETE FROM templates WHERE template_id = %s", (template_id,))
         db.commit()
+        if file_path:
+            path = Path(file_path)
+            if path.is_file():
+                path.unlink(missing_ok=True)
         return {"message": "删除成功", "template_id": template_id}
     except pymysql.MySQLError as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"模板删除失败：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+
+
+@router.get(
+    "/templates/{template_id}/download",
+    summary="导出模板",
+    description="根据模板ID导出模板文件"
+)
+def download_template(
+    template_id: str,
+    user=Depends(admin_only),
+    db: pymysql.connections.Connection = Depends(get_db),
+):
+    cursor = None
+    try:
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT oss_key, filename, content_type FROM templates WHERE template_id = %s",
+            (template_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="模板不存在")
+
+        if isinstance(row, dict):
+            oss_key = row.get("oss_key")
+            filename = row.get("filename") or "template"
+            content_type = row.get("content_type") or "application/octet-stream"
+        else:
+            oss_key = row[0]
+            filename = row[1] or "template"
+            content_type = row[2] or "application/octet-stream"
+
+        if not oss_key:
+            raise HTTPException(status_code=500, detail="模板存储路径缺失")
+
+        file_path = Path(oss_key)
+        if not file_path.is_file():
+            raise HTTPException(status_code=404, detail="模板文件不存在")
+
+        return FileResponse(
+            path=str(file_path),
+            media_type=content_type,
+            filename=filename,
+        )
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        raise HTTPException(status_code=500, detail=f"模板导出失败：{str(e)}")
     finally:
         if cursor:
             cursor.close()
