@@ -1,3 +1,5 @@
+import zipfile
+import urllib.parse
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, BackgroundTasks, Query
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
@@ -11,6 +13,8 @@ from app.schemas.document import (
     PaperStatusOut,
     PaperStatusUpdate,
     VersionOut,
+    DDLOut, 
+    DDLCreate, 
 )
 from app.services.oss import upload_file_to_oss, get_file_from_oss, upload_paper_to_storage
 from datetime import datetime
@@ -614,43 +618,277 @@ async def list_student_papers(
 )
 def download_paper(
     paper_id: int,
+    student_id: int = Query(..., description="待下载论文归属的学生ID"),
     db: pymysql.connections.Connection = Depends(get_db),
+    current_user: Optional[str] = Query(None, description="登录用户信息(JSON字符串，包含 sub/username/roles)"),
 ):
-    current_user = {"sub": 1}
+    current_user = _parse_current_user(current_user)
+    login_user_id = current_user.get("sub", 0)
+    login_user_roles = current_user.get("roles", [])
+    if login_user_id <= 0:
+        raise HTTPException(status_code=401, detail="请先登录后再操作")
     cursor = None
     try:
         cursor = db.cursor()
         cursor.execute(
-            "SELECT owner_id, latest_version, oss_key FROM papers WHERE id = %s",
+            "SELECT owner_id, teacher_id, latest_version, oss_key FROM papers WHERE id = %s",
             (paper_id,),
         )
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="论文不存在")
-        if row[0] != current_user.get("sub"):
-            raise HTTPException(status_code=403, detail="无权限下载该论文")
-        oss_key = row[2]
+        paper_owner_id, teacher_id, latest_version, oss_key = row
+        if paper_owner_id != student_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"传入的学生ID({student_id})与论文归属者ID({paper_owner_id})不一致"
+            )
+        is_student = (login_user_id == paper_owner_id)  
+        is_teacher = (login_user_id == teacher_id)    
+        is_admin = ("admin" in login_user_roles) or ("管理员" in login_user_roles)  # 管理员
+        if not is_student and not is_teacher and not is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail=f"无权限下载该论文：仅论文归属学生(ID={paper_owner_id})、关联老师(ID={teacher_id})或管理员可下载，当前登录用户ID={login_user_id}"
+            )
         if not oss_key:
-            raise HTTPException(status_code=404, detail="论文文件不存在")
+            raise HTTPException(status_code=404, detail="论文文件不存在（无存储路径）")
+        try:
+            docx_filename, docx_content = get_file_from_oss(oss_key)
+        except Exception as e:
+            raise HTTPException(status_code=404, detail=f"获取论文文件失败：{str(e)}")
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zip_file:
+            pure_docx_name = os.path.basename(docx_filename)
+            safe_docx_name = pure_docx_name.replace(" ", "_").replace("/", "_").replace("\\", "_")
+            zip_inner_filename = f"paper_{paper_id}_v{latest_version.lstrip('v')}_{safe_docx_name}"
+            zip_file.writestr(zip_inner_filename, docx_content)
+        zip_buffer.seek(0)
+        chinese_zip_name = f"论文_{paper_id}_v{latest_version.lstrip('v')}_{datetime.now().strftime('%Y%m%d')}.zip"
+        safe_zip_name = f"paper_{paper_id}_v{latest_version.lstrip('v')}_{datetime.now().strftime('%Y%m%d')}.zip"
+        encoded_chinese_name = urllib.parse.quote(chinese_zip_name, encoding='utf-8')
+        headers = {
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_chinese_name}; filename={safe_zip_name}",
+            "Content-Type": "application/zip",
+            "X-Content-Type-Options": "nosniff"  
+        }
+        return StreamingResponse(
+            zip_buffer,
+            media_type="application/zip",
+            headers=headers
+        )
     except HTTPException:
         raise
     except pymysql.MySQLError as e:
         raise HTTPException(status_code=500, detail=f"数据库查询失败: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"下载论文失败：{str(e)}")
     finally:
         if cursor:
             cursor.close()
-        db.close()
 
+
+@router.post(
+    "/ddl/create",
+    response_model=DDLOut,
+    summary="创建DDL截止时间",
+    description="仅教师可创建，且登录用户ID必须与教师ID一致，截止时间需精确到年月日时分秒"
+)
+def create_ddl(
+    year: str = Query(
+        ..., 
+        description="DDL年份（可选值：2024-2100）",
+        enum=[str(y) for y in range(2024, 2101)]
+    ),
+    month: str = Query(
+        ..., 
+        description="DDL月份（可选值：1-12）",
+        enum=[str(m) for m in range(1, 13)]
+    ),
+    day: str = Query(
+        ..., 
+        description="DDL日期（可选值：1-31）",
+        enum=[str(d) for d in range(1, 32)]
+    ),
+    hour: str = Query(
+        ..., 
+        description="DDL小时（可选值：0-23）",
+        enum=[str(h) for h in range(0, 24)]
+    ),
+    minute: str = Query(
+        ..., 
+        description="DDL分钟（可选值：0-59）",
+        enum=[str(m) for m in range(0, 60)]
+    ),
+    second: str = Query(
+        ..., 
+        description="DDL秒数（可选值：0-59）",
+        enum=[str(s) for s in range(0, 60)]
+    ),
+    teacher_id: int = Query(..., description="教师ID（必须为正整数）"),
+    db: pymysql.connections.Connection = Depends(get_db),
+    current_user: Optional[str] = Query(None, description="登录用户信息(JSON字符串，包含 sub/username/roles)"),
+):
+    current_user = _parse_current_user(current_user)
+    login_user_id = current_user.get("sub", 0)
+    login_user_roles = current_user.get("roles", [])
+    teacher_name = current_user.get("username", "") 
+    if not teacher_name:
+        raise HTTPException(status_code=400, detail="教师姓名不能为空")
+
+    if login_user_id <= 0:
+        raise HTTPException(status_code=401, detail="请先登录后再操作")
+    if "teacher" not in login_user_roles and "教师" not in login_user_roles:
+        raise HTTPException(status_code=403, detail="无权限创建DDL：仅教师角色可操作")
+    if not isinstance(teacher_id, int) or teacher_id <= 0:
+        raise HTTPException(status_code=400, detail="teacher_id必须是正整数")
+    if teacher_id != login_user_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"无权限创建DDL：传入的教师ID({teacher_id})与登录用户ID({login_user_id})不一致"
+        )
     try:
-        filename, content = get_file_from_oss(oss_key)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="论文文件不存在或已清理")
+        year_int = int(year)
+        month_int = int(month)
+        day_int = int(day)
+        hour_int = int(hour)
+        minute_int = int(minute)
+        second_int = int(second)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="时间参数格式错误，必须为数字")
+    try:
+        ddl_time = datetime(year_int, month_int, day_int, hour_int, minute_int, second_int)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法的日期时间组合：{str(e)}")
+    now = datetime.now()
+    if ddl_time < now:
+        raise HTTPException(status_code=400, detail="DDL截止时间不能早于当前时间")
+    cursor = None
+    try:
+        cursor = db.cursor()
+        create_sql = """
+        INSERT INTO ddl_management (creator_id, teacher_id, teacher_name, ddl_time, created_at)
+        VALUES (%s, %s, %s, %s, %s)
+        """
+        create_time = now.strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute(create_sql, (login_user_id, teacher_id, teacher_name, ddl_time, create_time))
+        ddlid = cursor.lastrowid
+        db.commit()
+        return DDLOut(
+            ddlid=ddlid,
+            creator_id=login_user_id,
+            teacher_id=teacher_id,
+            teacher_name=teacher_name, 
+            ddl_time=ddl_time.strftime("%Y-%m-%d %H:%M:%S"),
+            created_at=create_time
+        )
+    except pymysql.MySQLError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"创建DDL失败：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
 
-    headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"'
-    }
-    return StreamingResponse(
-        io.BytesIO(content),
-        media_type="application/octet-stream",
-        headers=headers,
-    )
+@router.get(
+    "/ddl/list",
+    response_model=List[DDLOut],
+    summary="查看DDL列表",
+    description="教师可查看自己创建的所有DDL，管理员可查看所有DDL"
+)
+def list_ddl(
+    teacher_id: int = Query(..., description="教师ID（查询该教师创建的DDL）"),
+    db: pymysql.connections.Connection = Depends(get_db),
+    current_user: Optional[str] = Query(None, description="登录用户信息(JSON字符串，包含 sub/username/roles)"),
+):
+    current_user = _parse_current_user(current_user)
+    login_user_id = current_user.get("sub", 0)
+    login_user_roles = current_user.get("roles", [])
+    if login_user_id <= 0:
+        raise HTTPException(status_code=401, detail="请先登录后再操作")
+    if not isinstance(teacher_id, int) or teacher_id <= 0:
+        raise HTTPException(status_code=400, detail="teacher_id必须是正整数")
+    is_admin = "admin" in login_user_roles or "管理员" in login_user_roles
+    if teacher_id != login_user_id and not is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail=f"无权限查看：仅可查看自己创建的DDL或管理员查看，传入的teacher_id({teacher_id})与登录用户ID({login_user_id})不一致"
+        )
+    cursor = None
+    try:
+        cursor = db.cursor(pymysql.cursors.DictCursor)
+        query_sql = """
+        SELECT ddlid, creator_id, teacher_id, teacher_name, ddl_time, created_at
+        FROM ddl_management 
+        WHERE teacher_id = %s 
+        ORDER BY ddl_time DESC
+        """
+        cursor.execute(query_sql, (teacher_id,))
+        ddl_records = cursor.fetchall()
+        result = []
+        for record in ddl_records:
+            result.append(DDLOut(
+                ddlid=record["ddlid"],
+                creator_id=record["creator_id"],
+                teacher_id=record["teacher_id"],
+                teacher_name=record["teacher_name"], 
+                ddl_time=record["ddl_time"].strftime("%Y-%m-%d %H:%M:%S") if isinstance(record["ddl_time"], datetime) else record["ddl_time"],
+                created_at=record["created_at"].strftime("%Y-%m-%d %H:%M:%S") if isinstance(record["created_at"], datetime) else record["created_at"]
+            ))
+        return result
+    except pymysql.MySQLError as e:
+        raise HTTPException(status_code=500, detail=f"查询DDL失败：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+
+@router.delete(
+    "/ddl/{ddlid}",
+    summary="删除DDL",
+    description="仅创建该DDL的教师可删除，或管理员可删除"
+)
+def delete_ddl(
+    ddlid: int,
+    db: pymysql.connections.Connection = Depends(get_db),
+    current_user: Optional[str] = Query(None, description="登录用户信息(JSON字符串，包含 sub/username/roles)"),
+):
+    current_user = _parse_current_user(current_user)
+    login_user_id = current_user.get("sub", 0)
+    login_user_roles = current_user.get("roles", [])
+    if login_user_id <= 0:
+        raise HTTPException(status_code=401, detail="请先登录后再操作")
+    if not isinstance(ddlid, int) or ddlid <= 0:
+        raise HTTPException(status_code=400, detail="ddlid必须是正整数")
+    cursor = None
+    try:
+        cursor = db.cursor()
+        check_sql = "SELECT teacher_id, teacher_name FROM ddl_management WHERE ddlid = %s"
+        cursor.execute(check_sql, (ddlid,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"DDL ID {ddlid} 不存在")
+        ddl_teacher_id = row[0]
+
+        is_admin = "admin" in login_user_roles or "管理员" in login_user_roles
+        is_owner = ddl_teacher_id == login_user_id
+        
+        if not is_owner and not is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail=f"无权限删除：仅创建该DDL的教师（ID={ddl_teacher_id}）或管理员可删除，当前登录用户ID={login_user_id}"
+            )
+        delete_sql = "DELETE FROM ddl_management WHERE ddlid = %s"
+        cursor.execute(delete_sql, (ddlid,))
+        db.commit()
+        
+        return {
+            "message": f"DDL {ddlid} 删除成功",
+            "ddlid": ddlid,
+            "deleted_by": login_user_id,
+            "deleted_by_role": login_user_roles
+        }
+    except pymysql.MySQLError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"删除DDL失败：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
