@@ -1,5 +1,5 @@
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query
-from typing import Optional
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query, Header, Request, Body
+from typing import Optional, List
 from pydantic import BaseModel
 from app.core.dependencies import get_current_user
 from app.core.security import decode_access_token, create_access_token 
@@ -35,6 +35,20 @@ class GroupUpdate(BaseModel):
     group_name: str | None = None
     teacher_id: str | None = None
     description: str | None = None
+
+
+class GroupBind(BaseModel):
+    """绑定群组请求体"""
+    group_id: str
+    group_name: str
+    member_type: str  # 只能是 teacher 或 student
+    member_id: int     # 用户内部 ID
+    role: str = "member"  # 成员角色：member 或 admin
+
+
+class BindRequest(BaseModel):
+    """绑定群组请求包装器"""
+    payload: GroupBind
 
 
 def _parse_current_user(current_user: Optional[dict|str]) -> dict:
@@ -111,65 +125,119 @@ def _ensure_caller_identity(cursor, cu: dict) -> None:
 )
 def list_groups(
     keyword: str | None = Query(None, description="群组编号/名称关键词"),
-    teacher_id: str | None = Query(None, description="按教师工号筛选"),
+    teacher_id: str | None = Query(None, description="按教师工号或教师内部ID筛选（管理员可指定；教师可空使用自身）"),
     page: int = Query(1, ge=1, description="页码（从1开始）"),
     page_size: int = Query(20, ge=1, le=100, description="每页条数（1-100）"),
+    current_user: Optional[str] = Header(None, alias="X-Current-User", description="当前登录用户信息(JSON字符串)，示例: {\"sub\":1,\"roles\":[\"admin\"],\"username\":\"admin\"}"),
 ):
+    cu = _parse_current_user(current_user)
+    roles_norm = _normalize_roles(cu.get("roles", []))
+    # only teachers or admins can call this endpoint
+    if not ("admin" in roles_norm or "teacher" in roles_norm):
+        raise HTTPException(status_code=403, detail="仅管理员或教师可查询教师所属群组")
+
     conn = get_connection()
     cursor = None
     try:
         cursor = conn.cursor(pymysql.cursors.DictCursor)
-        where_sql = "WHERE 1=1"
-        params: list = []
-        if keyword:
-            where_sql += " AND (group_id LIKE %s OR group_name LIKE %s)"
-            like_value = f"%{keyword}%"
-            params.extend([like_value, like_value])
+        # resolve teacher internal id: allow passing teacher.teacher_id (工号) or internal id
+        teacher_internal_id = None
         if teacher_id:
-            where_sql += " AND teacher_id = %s"
-            params.append(teacher_id)
+            # try find by teacher.teacher_id first
+            cursor.execute("SELECT id FROM teachers WHERE teacher_id = %s", (teacher_id,))
+            r = cursor.fetchone()
+            if r:
+                teacher_internal_id = r["id"] if isinstance(r, dict) else r[0]
+            else:
+                # if numeric, try by internal id
+                try:
+                    tid = int(teacher_id)
+                    cursor.execute("SELECT id FROM teachers WHERE id = %s", (tid,))
+                    r2 = cursor.fetchone()
+                    if r2:
+                        teacher_internal_id = r2["id"] if isinstance(r2, dict) else r2[0]
+                except Exception:
+                    teacher_internal_id = None
 
-        count_sql = f"SELECT COUNT(*) as total FROM `groups` {where_sql}"
-        cursor.execute(count_sql, tuple(params))
-        total = cursor.fetchone()["total"]
+        # if caller is teacher and didn't provide teacher_id, use their identity
+        if not teacher_internal_id and "teacher" in roles_norm:
+            teacher_internal_id = cu.get("sub", None)
 
-        offset = (page - 1) * page_size
-        list_sql = f"""
+        if not teacher_internal_id or teacher_internal_id == 0:
+            raise HTTPException(status_code=400, detail="需要提供有效的教师ID或调用者必须是教师")
+
+        # ensure the teacher exists
+        cursor.execute("SELECT id, teacher_id FROM teachers WHERE id = %s", (teacher_internal_id,))
+        trow = cursor.fetchone()
+        if not trow:
+            raise HTTPException(status_code=404, detail="指定教师不存在")
+
+        # Query groups where this teacher is a (active) member
+        # For each group compute: student_count, pending_papers (待审阅), reviewed_papers (已审阅)
+        list_sql = """
         SELECT
-            g.id,
             g.group_id,
             g.group_name,
-            g.teacher_id,
             g.description,
             g.created_at,
             g.updated_at,
             (
-                SELECT COUNT(*)
-                FROM `group_members` gm
-                WHERE gm.group_id = g.group_id AND gm.is_active = 1
-            ) AS member_count
+                SELECT COUNT(*) FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_type='student' AND gm.is_active=1
+            ) AS student_count,
+            (SELECT COUNT(DISTINCT pv.paper_id)
+                FROM paper_versions pv
+                JOIN papers p ON pv.paper_id = p.id
+                WHERE p.owner_id IN (
+                    SELECT member_id FROM group_members WHERE group_id = g.group_id AND member_type='student' AND is_active=1
+                ) AND pv.status = '待审阅'
+            ) AS pending_papers,
+            (
+                SELECT COUNT(DISTINCT pv2.paper_id)
+                FROM paper_versions pv2
+                JOIN papers p2 ON pv2.paper_id = p2.id
+                WHERE p2.owner_id IN (
+                    SELECT member_id FROM group_members WHERE group_id = g.group_id AND member_type='student' AND is_active=1
+                ) AND pv2.status = '已审阅'
+            ) AS reviewed_papers
         FROM `groups` g
-        {where_sql}
+        WHERE EXISTS (
+            SELECT 1 FROM group_members gm2 WHERE gm2.group_id = g.group_id AND gm2.member_type='teacher' AND gm2.member_id = %s AND gm2.is_active=1
+        )
+        AND (g.group_id LIKE %s OR g.group_name LIKE %s)
         ORDER BY g.created_at DESC
         LIMIT %s OFFSET %s
         """
-        cursor.execute(list_sql, tuple(params + [page_size, offset]))
+
+        like_value = f"%{keyword}%" if keyword else "%"
+        offset = (page - 1) * page_size
+        cursor.execute(list_sql, (like_value, like_value, teacher_internal_id, page_size, offset))
         rows = cursor.fetchall()
+
+        # count total matching groups for pagination
+        count_sql = """
+        SELECT COUNT(*) AS total
+        FROM `groups` g
+        WHERE EXISTS (
+            SELECT 1 FROM group_members gm2 WHERE gm2.group_id = g.group_id AND gm2.member_type='teacher' AND gm2.member_id = %s AND gm2.is_active=1
+        )
+        AND (g.group_id LIKE %s OR g.group_name LIKE %s)
+        """
+        cursor.execute(count_sql, (teacher_internal_id, like_value, like_value))
+        cnt_row = cursor.fetchone()
+        total = cnt_row["total"] if cnt_row and isinstance(cnt_row, dict) else (cnt_row[0] if cnt_row else 0)
 
         items = []
         for row in rows:
-            items.append(
-                {
-                    "id": row["id"],
-                    "group_id": row["group_id"],
-                    "group_name": row["group_name"],
-                    "teacher_id": row["teacher_id"],
-                    "description": row["description"],
-                    "member_count": row["member_count"],
-                    "created_at": row["created_at"].strftime("%Y-%m-%d %H:%M:%S") if row["created_at"] else None,
-                    "updated_at": row["updated_at"].strftime("%Y-%m-%d %H:%M:%S") if row["updated_at"] else None,
-                }
-            )
+            items.append({
+                "group_id": row["group_id"],
+                "group_name": row["group_name"],
+                "description": row.get("description"),
+                "student_count": int(row.get("student_count", 0) or 0),
+                "pending_papers": int(row.get("pending_papers", 0) or 0),
+                "reviewed_papers": int(row.get("reviewed_papers", 0) or 0),
+                "created_at": row["created_at"].strftime("%Y-%m-%d %H:%M:%S") if row.get("created_at") else None,
+                "updated_at": row["updated_at"].strftime("%Y-%m-%d %H:%M:%S") if row.get("updated_at") else None,
+            })
 
         return {
             "items": items,
@@ -365,14 +433,19 @@ async def import_groups(
     summary="创建群组",
     description=(
         "新增单个群组记录。\n"
-        "必填 payload 字段：group_name。\n"
-        "可选 payload 字段：group_id（不传则自动生成），teacher_id, description。\n"
-        "可选 payload 字段：teacher_id, description。\n"
+        "必填字段：group_name。\n"
+        "可选字段：group_id（不传则自动生成），teacher_id, description。\n"
         "必填 current_user 字段：sub(数据库用户id), roles(包含 teacher 或 admin), username。\n"
         "示例 current_user: {\"sub\": 3, \"roles\": [\"teacher\"], \"username\": \"li\"}"
     )
 )
-async def create_group(payload: GroupCreate, current_user: dict = {"roles": ["admin"], "username": "test_user"}):
+async def create_group(
+    group_name: str = Query(..., description="群组名称"),
+    group_id: str = Query(None, description="群组 ID（不传则自动生成）"),
+    teacher_id: str = Query(None, description="教师工号"),
+    description: str = Query(None, description="群组描述"),
+    current_user: dict = {"roles": ["admin"], "username": "test_user"}
+):
     cu = _parse_current_user(current_user)
     # Only teachers or admins can create groups
     allowed = {"admin", "teacher"}
@@ -387,7 +460,7 @@ async def create_group(payload: GroupCreate, current_user: dict = {"roles": ["ad
         # ensure caller exists in the corresponding table
         _ensure_caller_identity(cursor, cu)
 
-        group_id_value = (payload.group_id or "").strip() or None
+        group_id_value = (group_id or "").strip() or None
         if not group_id_value:
             cursor.execute(
                 "SELECT MAX(CAST(`group_id` AS UNSIGNED)) FROM `groups` WHERE `group_id` REGEXP '^[0-9]+$'"
@@ -407,9 +480,9 @@ async def create_group(payload: GroupCreate, current_user: dict = {"roles": ["ad
             insert_sql,
             (
                 group_id_value,
-                payload.group_name.strip(),
-                payload.teacher_id.strip() if payload.teacher_id else None,
-                payload.description.strip() if payload.description else None,
+                group_name.strip(),
+                teacher_id.strip() if teacher_id else None,
+                description.strip() if description else None,
             ),
         )
         # create owner member record: creator becomes group owner
@@ -426,9 +499,9 @@ async def create_group(payload: GroupCreate, current_user: dict = {"roles": ["ad
         conn.commit()
         return {
             "group_id": group_id_value,
-            "group_name": payload.group_name,
-            "teacher_id": payload.teacher_id,
-            "description": payload.description,
+            "group_name": group_name,
+            "teacher_id": teacher_id,
+            "description": description,
             "message": "群组创建成功",
         }
     except pymysql.err.IntegrityError:
@@ -442,6 +515,81 @@ async def create_group(payload: GroupCreate, current_user: dict = {"roles": ["ad
             cursor.close()
         except Exception:
             pass
+        conn.close()
+
+
+@router.post(
+    "/bind",
+    summary="绑定群组",
+    description="将用户绑定到指定群组"
+)
+async def bind_group(
+    group_id: str = Query(..., description="群组 ID"),
+    group_name: str = Query(..., description="班级名称"),
+    member_type: str = Query(..., description="入群身份，只能是 teacher 或 student"),
+    member_id: int = Query(..., description="用户内部 ID"),
+    role: str = Query("member", description="角色，只能是 member 或 admin"),
+    current_user: dict = {"roles": ["admin"], "username": "test_user"}
+):
+    """绑定用户到群组的实现"""
+    # 解析请求体
+    try:
+        # 验证入群身份
+        if member_type not in ["teacher", "student"]:
+            raise HTTPException(status_code=400, detail="入群身份只能是教师或学生")
+        
+        # 验证角色
+        if role not in ["member", "admin"]:
+            raise HTTPException(status_code=400, detail="角色必须是 member 或 admin")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"请求参数错误：{str(e)}")
+    
+    conn = get_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        
+        # 验证群组是否存在
+        cursor.execute("SELECT 1 FROM `groups` WHERE `group_id` = %s", (group_id,))
+        if not cursor.fetchone():
+            # 群组不存在，创建新群组
+            cursor.execute("""
+                INSERT INTO `groups` (`group_id`, `group_name`, `description`)
+                VALUES (%s, %s, %s)
+            """, (group_id, group_name, None))
+        
+        # 验证用户是否存在
+        table_map = {"teacher": "teachers", "student": "students"}
+        cursor.execute(f"SELECT 1 FROM `{table_map[member_type]}` WHERE `id` = %s", (member_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail=f"用户 ID {member_id} 不存在")
+        
+        # 绑定用户到群组
+        cursor.execute("""
+            INSERT INTO `group_members` (`group_id`, `member_id`, `member_type`, `role`, `is_active`, `joined_at`)
+            VALUES (%s, %s, %s, %s, 1, NOW())
+            ON DUPLICATE KEY UPDATE `is_active` = 1, `role` = VALUES(`role`), `updated_at` = NOW()
+        """, (group_id, member_id, member_type, role))
+        
+        conn.commit()
+        return {
+            "group_id": group_id,
+            "group_name": group_name,
+            "member_id": member_id,
+            "member_type": member_type,
+            "role": role,
+            "message": "绑定成功"
+        }
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
         conn.close()
 
 
@@ -689,4 +837,348 @@ async def remove_group_member(group_id: str, payload: GroupMember, current_user:
             cursor.close()
         except Exception:
             pass
+        conn.close()
+
+
+@router.get(
+    "/{group_id}/students",
+    summary="获取班级学生列表",
+    description="获取指定班级的所有学生及其论文状态"
+)
+async def get_class_students(
+    group_id: str,
+    current_user: str = Query('{"sub": 1, "roles": ["admin"], "username": "admin"}', description="当前登录用户信息(JSON字符串)，示例: {\"sub\":1,\"roles\":[\"admin\"],\"username\":\"admin\"}")
+):
+    """获取班级学生列表的实现"""
+    cu = _parse_current_user(current_user)
+    roles_norm = _normalize_roles(cu.get("roles", []))
+    
+    # 验证权限：只有管理员或教师可以查看班级学生列表
+    if not ("admin" in roles_norm or "teacher" in roles_norm):
+        raise HTTPException(status_code=403, detail="仅管理员或教师可查看班级学生列表")
+
+    conn = get_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        
+        # 验证群组是否存在
+        cursor.execute("SELECT 1 FROM `groups` WHERE `group_id` = %s", (group_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="群组不存在")
+        
+        # 获取班级所有学生信息及论文状态
+        sql = """
+        SELECT
+            s.id as student_id,
+            s.name as student_name,
+            s.student_id as student_number,
+            p.id as paper_id,
+            pv.version as paper_version,
+            pv.status as paper_status,
+            pv.updated_at as paper_update_time,
+            (SELECT COUNT(*) FROM annotations WHERE paper_id = p.id) as annotation_count
+        FROM
+            students s
+        JOIN
+            group_members gm ON s.id = gm.member_id AND gm.member_type = 'student' AND gm.is_active = 1
+        LEFT JOIN
+            papers p ON s.id = p.owner_id
+        LEFT JOIN
+            paper_versions pv ON p.id = pv.paper_id
+        WHERE
+            gm.group_id = %s
+        ORDER BY
+            s.name ASC,
+            pv.updated_at DESC
+        """
+        
+        cursor.execute(sql, (group_id,))
+        rows = cursor.fetchall()
+        
+        # 处理结果，按学生分组，只保留每个学生的最新版本论文
+        students = {}
+        paper_versions = {}
+        
+        for row in rows:
+            student_id = row.get('student_id')
+            paper_id = row.get('paper_id')
+            
+            if student_id not in students:
+                students[student_id] = {
+                    "student_id": student_id,
+                    "student_name": row.get('student_name'),
+                    "student_number": row.get('student_number'),
+                    "papers": []
+                }
+            
+            # 如果有论文信息，记录论文版本，只保留最新版本
+            if paper_id:
+                if paper_id not in paper_versions:
+                    paper_versions[paper_id] = row
+        
+        # 为每个学生添加最新版本的论文
+        for student_id, student_info in students.items():
+            for paper_id, paper_info in paper_versions.items():
+                if paper_info.get('student_id') == student_id:
+                    student_info["papers"].append({
+                        "paper_id": paper_id,
+                        "paper_version": f"v{paper_info.get('paper_version', 1)}",
+                        "paper_status": paper_info.get('paper_status'),
+                        "paper_update_time": paper_info.get('paper_update_time').strftime("%Y-%m-%d %H:%M:%S") if paper_info.get('paper_update_time') else None,
+                        "annotation_count": paper_info.get('annotation_count', 0)
+                    })
+        
+        # 转换为列表格式
+        result = list(students.values())
+        
+        return {
+            "group_id": group_id,
+            "students": result,
+            "total": len(result)
+        }
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
+@router.get(
+    "/papers",
+    summary="查看群组论文列表",
+    description="老师查看指定群组的所有成员提交的论文信息"
+)
+async def get_group_papers(
+    teacher_id: str = Query(..., description="教师ID"),
+    group_id: str = Query(..., description="群组ID"),
+    current_user: str = Query('{"sub": 1, "roles": ["admin"], "username": "admin"}', description="当前登录用户信息(JSON字符串)，示例: {\"sub\":1,\"roles\":[\"admin\"],\"username\":\"admin\"}")
+):
+    """查看群组论文列表的实现"""
+    cu = _parse_current_user(current_user)
+    roles_norm = _normalize_roles(cu.get("roles", []))
+    
+    # 验证权限：只有管理员或教师可以查看群组论文列表
+    if not ("admin" in roles_norm or "teacher" in roles_norm):
+        raise HTTPException(status_code=403, detail="仅管理员或教师可查看群组论文列表")
+
+    conn = get_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        
+        # 验证教师是否存在
+        teacher_internal_id = None
+        # 尝试通过教师工号查找
+        cursor.execute("SELECT id FROM teachers WHERE teacher_id = %s", (teacher_id,))
+        r = cursor.fetchone()
+        if r:
+            teacher_internal_id = r["id"] if isinstance(r, dict) else r[0]
+        else:
+            # 尝试通过内部ID查找
+            try:
+                tid = int(teacher_id)
+                cursor.execute("SELECT id FROM teachers WHERE id = %s", (tid,))
+                r2 = cursor.fetchone()
+                if r2:
+                    teacher_internal_id = r2["id"] if isinstance(r2, dict) else r2[0]
+            except Exception:
+                pass
+        
+        if not teacher_internal_id:
+            raise HTTPException(status_code=404, detail="指定教师不存在")
+        
+        # 验证群组是否存在
+        cursor.execute("SELECT 1 FROM `groups` WHERE `group_id` = %s", (group_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="群组不存在")
+        
+        # 验证教师是否是该群组的成员
+        cursor.execute("""
+            SELECT 1 FROM `group_members` 
+            WHERE `group_id` = %s AND `member_id` = %s AND `member_type` = 'teacher' AND `is_active` = 1
+        """, (group_id, teacher_internal_id))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=403, detail="教师不是该群组的成员")
+        
+        # 获取群组所有学生的论文信息
+        sql = """
+        SELECT
+            s.id as student_id,
+            s.name as student_name,
+            s.student_id as student_number,
+            p.id as paper_id,
+            pv.version as paper_version,
+            pv.status as paper_status,
+            pv.updated_at as paper_update_time,
+            (SELECT COUNT(*) FROM annotations WHERE paper_id = p.id) as annotation_count
+        FROM
+            students s
+        JOIN
+            group_members gm ON s.id = gm.member_id AND gm.member_type = 'student' AND gm.is_active = 1
+        LEFT JOIN
+            papers p ON s.id = p.owner_id
+        LEFT JOIN
+            paper_versions pv ON p.id = pv.paper_id
+        WHERE
+            gm.group_id = %s
+        ORDER BY
+            s.name ASC,
+            pv.updated_at DESC
+        """
+        
+        cursor.execute(sql, (group_id,))
+        rows = cursor.fetchall()
+        
+        # 处理结果，按学生分组，只保留每个学生的最新版本论文
+        papers = []
+        paper_versions = {}
+        
+        for row in rows:
+            paper_id = row.get('paper_id')
+            
+            if paper_id:
+                if paper_id not in paper_versions:
+                    paper_versions[paper_id] = row
+        
+        # 构建论文列表
+        for paper_id, paper_info in paper_versions.items():
+            papers.append({
+                "paper_id": paper_id,
+                "student_id": paper_info.get('student_id'),
+                "student_name": paper_info.get('student_name'),
+                "student_number": paper_info.get('student_number'),
+                "paper_version": f"v{paper_info.get('paper_version', 1)}",
+                "paper_status": paper_info.get('paper_status'),
+                "paper_update_time": paper_info.get('paper_update_time').strftime("%Y-%m-%d %H:%M:%S") if paper_info.get('paper_update_time') else None,
+                "annotation_count": paper_info.get('annotation_count', 0)
+            })
+        
+        return {
+            "group_id": group_id,
+            "teacher_id": teacher_id,
+            "papers": papers,
+            "total": len(papers)
+        }
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
+@router.post(
+    "/download/batch",
+    summary="批量下载群组论文",
+    description="管理员或老师批量下载指定群组的学生论文，支持zip和原格式下载"
+)
+async def batch_download_papers(
+    group_id: str = Query(..., description="群组ID"),
+    student_ids: List[int] = Query(None, description="要下载论文的学生ID列表，不传则下载所有学生的论文"),
+    format: str = Query("zip", description="下载格式：zip或original"),
+    current_user: str = Query('{"sub": 1, "roles": ["admin"], "username": "admin"}', description="当前登录用户信息(JSON字符串)，示例: {\"sub\":1,\"roles\":[\"admin\"],\"username\":\"admin\"}")
+):
+    """批量下载群组论文的实现"""
+    cu = _parse_current_user(current_user)
+    roles_norm = _normalize_roles(cu.get("roles", []))
+    
+    # 验证权限：只有管理员或教师可以批量下载论文
+    if not ("admin" in roles_norm or "teacher" in roles_norm):
+        raise HTTPException(status_code=403, detail="仅管理员或教师可批量下载论文")
+
+    # 验证格式参数
+    if format not in ["zip", "original"]:
+        raise HTTPException(status_code=400, detail="下载格式只能是zip或original")
+
+    conn = get_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        
+        # 验证群组是否存在
+        cursor.execute("SELECT 1 FROM `groups` WHERE `group_id` = %s", (group_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="群组不存在")
+        
+        # 构建SQL查询条件
+        where_clause = "gm.group_id = %s"
+        params = [group_id]
+        
+        if student_ids:
+            # 为每个学生ID创建占位符
+            placeholders = ', '.join(['%s'] * len(student_ids))
+            where_clause += f" AND s.id IN ({placeholders})"
+            params.extend(student_ids)
+        
+        # 获取群组学生的论文信息
+        sql = f"""
+        SELECT
+            s.id as student_id,
+            s.name as student_name,
+            s.student_id as student_number,
+            p.id as paper_id,
+            p.oss_key as oss_key,
+            pv.version as paper_version,
+            pv.status as paper_status
+        FROM
+            students s
+        JOIN
+            group_members gm ON s.id = gm.member_id AND gm.member_type = 'student' AND gm.is_active = 1
+        LEFT JOIN
+            papers p ON s.id = p.owner_id
+        LEFT JOIN
+            paper_versions pv ON p.id = pv.paper_id
+        WHERE
+            {where_clause}
+        ORDER BY
+            s.name ASC,
+            pv.updated_at DESC
+        """
+        
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+        
+        if not rows:
+            raise HTTPException(status_code=404, detail="未找到指定学生的论文")
+        
+        # 处理论文下载
+        # 这里需要实现具体的下载逻辑，包括：
+        # 1. 从OSS获取论文文件
+        # 2. 按格式打包或直接返回
+        # 3. 返回StreamingResponse
+        
+        # 由于缺少具体的OSS实现，这里返回模拟响应
+        papers_to_download = []
+        for row in rows:
+            paper_id = row.get('paper_id')
+            if paper_id:
+                papers_to_download.append({
+                    "paper_id": paper_id,
+                    "student_id": row.get('student_id'),
+                    "student_name": row.get('student_name'),
+                    "student_number": row.get('student_number'),
+                    "paper_version": row.get('paper_version'),
+                    "oss_key": row.get('oss_key')
+                })
+        
+        return {
+            "group_id": group_id,
+            "format": format,
+            "total_papers": len(papers_to_download),
+            "papers": papers_to_download,
+            "message": f"成功准备{len(papers_to_download)}篇论文，格式为{format}"
+        }
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
         conn.close()
