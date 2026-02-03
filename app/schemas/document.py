@@ -50,3 +50,17 @@ class MaterialResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class DDLCreate(BaseModel):
+    teacher_id: int
+    ddl_time: str 
+
+class DDLOut(BaseModel):
+    ddlid: int
+    creator_id: int
+    teacher_id: int
+    ddl_time: str
+    created_at: Optional[str] = None
+
+    class Config:
+        orm_mode = True
