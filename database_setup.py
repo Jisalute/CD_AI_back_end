@@ -178,37 +178,26 @@ PAPERS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS `papers` (
     `id` INT NOT NULL AUTO_INCREMENT COMMENT '论文ID',
     `owner_id` INT NOT NULL COMMENT '所有者ID',
-    `teacher_id` INT NOT NULL COMMENT '老师ID', 
+    `teacher_id` INT NOT NULL COMMENT '老师ID',
     `latest_version` VARCHAR(20) NOT NULL COMMENT '最新版本号',
+    `version` VARCHAR(20) NOT NULL COMMENT '当前版本号',
+    `size` INT NOT NULL COMMENT '文件大小（字节）',
+    `status` VARCHAR(32) NOT NULL COMMENT '状态（如uploaded, processing, completed等）',
+    `detail` TEXT COMMENT '状态描述',
+    `ddl` DATETIME DEFAULT NULL COMMENT '截止时间',
     `oss_key` VARCHAR(255) NOT NULL COMMENT 'OSS存储键',
+    `submitted_by_name` VARCHAR(128) DEFAULT NULL COMMENT '提交者姓名',
+    `submitted_by_role` VARCHAR(64) DEFAULT NULL COMMENT '提交者角色',
+    `operated_by` VARCHAR(64) DEFAULT NULL COMMENT '操作人',
+    `operated_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '操作时间',
     `created_at` DATETIME NOT NULL COMMENT '创建时间',
     `updated_at` DATETIME NOT NULL COMMENT '更新时间',
     PRIMARY KEY (`id`),
     KEY `idx_owner_id` (`owner_id`),
-    KEY `idx_teacher_id` (`teacher_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='论文基础信息表';
-"""
-
-
-PAPER_VERSIONS_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS `paper_versions` (
-    `id` INT NOT NULL AUTO_INCREMENT COMMENT '版本记录ID',
-    `paper_id` INT NOT NULL COMMENT '所属论文ID',
-    `teacher_id` INT NOT NULL COMMENT '老师ID', 
-    `version` VARCHAR(20) NOT NULL COMMENT '版本号',
-    `size` INT NOT NULL COMMENT '文件大小（字节）',
-    `created_at` DATETIME NOT NULL COMMENT '创建时间',
-    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-    `status` VARCHAR(20) NOT NULL COMMENT '状态（如uploaded, processing, completed等）',
-    `submitted_by_id` BIGINT UNSIGNED DEFAULT NULL COMMENT '提交者ID',
-    `submitted_by_name` VARCHAR(128) DEFAULT NULL COMMENT '提交者姓名',
-    `submitted_by_role` VARCHAR(64) DEFAULT NULL COMMENT '提交者角色',
-    PRIMARY KEY (`id`),
-    KEY `idx_paper_id` (`paper_id`),
-    KEY `idx_version` (`version`),
     KEY `idx_teacher_id` (`teacher_id`),
-    CONSTRAINT `fk_paper_versions_paper_id` FOREIGN KEY (`paper_id`) REFERENCES `papers` (`id`) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='论文版本信息表';
+    KEY `idx_version` (`version`),
+    KEY `idx_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='论文信息表';
 """
 
 
@@ -229,23 +218,6 @@ CREATE TABLE IF NOT EXISTS `annotations` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='批注表';
 """
 
-
-PAPER_STATUS_RECORDS_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS `paper_status_records` (
-    `id` INT NOT NULL AUTO_INCREMENT COMMENT '状态记录ID',
-    `paper_id` INT NOT NULL COMMENT '论文ID',
-    `version` VARCHAR(20) NOT NULL COMMENT '版本号',
-    `status` VARCHAR(32) NOT NULL COMMENT '状态值',
-    `detail` TEXT COMMENT '状态描述',
-    `operated_by` VARCHAR(64) DEFAULT NULL COMMENT '操作人',
-    `operated_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '操作时间',
-    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
-    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
-    PRIMARY KEY (`id`),
-    KEY `idx_paper_status_paper_version` (`paper_id`, `version`),
-    KEY `idx_paper_status_status` (`status`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='论文状态记录表';
-"""
 
 DDL_MANAGEMENT_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS ddl_management (
@@ -346,7 +318,6 @@ def init_db(database_url: str | None = None) -> None:
                 GROUPS_TABLE_SQL,
                 GROUP_MEMBERS_TABLE_SQL,
                 PAPERS_TABLE_SQL,
-                PAPER_VERSIONS_TABLE_SQL,
                 ANNOTATIONS_TABLE_SQL,
                 TEMPLATES_TABLE_SQL,
                 USER_MESSAGES_TABLE_SQL,
@@ -355,7 +326,7 @@ def init_db(database_url: str | None = None) -> None:
                 cur.execute(sql)
         print(
             "Tables ensured: students, teachers, admins, file_records, groups, group_members, "
-            "papers, paper_versions, paper_status_records, annotations, templates, user_messages, operation_logs"
+            "papers, annotations, templates, user_messages, operation_logs"
         )
     finally:
         conn.close()
@@ -449,32 +420,20 @@ TABLE_COLUMN_DEFINITIONS = {
     "papers": {
         "id": "`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY",
         "owner_id": "`owner_id` INT NOT NULL COMMENT '所有者ID'",
+        "teacher_id": "`teacher_id` INT NOT NULL COMMENT '老师ID'",
         "latest_version": "`latest_version` VARCHAR(20) NOT NULL COMMENT '最新版本号'",
+        "version": "`version` VARCHAR(20) NOT NULL COMMENT '当前版本号'",
+        "size": "`size` INT NOT NULL COMMENT '文件大小（字节）'",
+        "status": "`status` VARCHAR(32) NOT NULL COMMENT '状态（如uploaded, processing, completed等）'",
+        "detail": "`detail` TEXT COMMENT '状态描述'",
         "ddl": "`ddl` DATETIME DEFAULT NULL COMMENT '截止时间'",
         "oss_key": "`oss_key` VARCHAR(255) NOT NULL COMMENT 'OSS存储键'",
-        "created_at": "`created_at` DATETIME NOT NULL COMMENT '创建时间'",
-        "updated_at": "`updated_at` DATETIME NOT NULL COMMENT '更新时间'",
-    },
-    "paper_versions": {
-        "id": "`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY",
-        "paper_id": "`paper_id` INT NOT NULL COMMENT '所属论文ID'",
-        "version": "`version` VARCHAR(20) NOT NULL COMMENT '版本号'",
-        "size": "`size` INT NOT NULL COMMENT '文件大小（字节）'",
-        "created_at": "`created_at` DATETIME NOT NULL COMMENT '创建时间'",
-        "updated_at": "`updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'",
-        "status": "`status` VARCHAR(20) NOT NULL COMMENT '状态（如uploaded, processing, completed等）'",
-        "submitted_by_id": "`submitted_by_id` BIGINT UNSIGNED DEFAULT NULL COMMENT '提交者ID'",
         "submitted_by_name": "`submitted_by_name` VARCHAR(128) DEFAULT NULL COMMENT '提交者姓名'",
         "submitted_by_role": "`submitted_by_role` VARCHAR(64) DEFAULT NULL COMMENT '提交者角色'",
-    },
-    "paper_status_records": {
-        "id": "`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY",
-        "paper_id": "`paper_id` INT NOT NULL COMMENT '论文ID'",
-        "version": "`version` VARCHAR(20) NOT NULL COMMENT '版本号'",
-        "status": "`status` VARCHAR(32) NOT NULL COMMENT '状态值'",
-        "detail": "`detail` TEXT COMMENT '状态描述'",
         "operated_by": "`operated_by` VARCHAR(64) DEFAULT NULL COMMENT '操作人'",
         "operated_time": "`operated_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '操作时间'",
+        "created_at": "`created_at` DATETIME NOT NULL COMMENT '创建时间'",
+        "updated_at": "`updated_at` DATETIME NOT NULL COMMENT '更新时间'",
     },
     "annotations": {
         "id": "`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY",
@@ -561,13 +520,10 @@ TABLE_INDEX_DEFINITIONS = {
         "CREATE INDEX idx_group_id ON `group_members` (group_id)"
     ],
     "papers": [
-        "CREATE INDEX idx_owner_id ON `papers` (owner_id)"
-    ],
-    "paper_versions": [
-        "CREATE INDEX idx_paper_id ON `paper_versions` (paper_id)",
-        "CREATE INDEX idx_version ON `paper_versions` (version)"
-        , "CREATE INDEX idx_paper_status_paper_version ON `paper_versions` (paper_id, version)",
-        "CREATE INDEX idx_paper_status_status ON `paper_versions` (status)"
+        "CREATE INDEX idx_owner_id ON `papers` (owner_id)",
+        "CREATE INDEX idx_teacher_id ON `papers` (teacher_id)",
+        "CREATE INDEX idx_version ON `papers` (version)",
+        "CREATE INDEX idx_status ON `papers` (status)"
     ],
     "annotations": [
         "CREATE INDEX idx_annotations_paper_id ON `annotations` (paper_id)",
@@ -614,7 +570,6 @@ def sync_schema(database_url: str | None = None) -> None:
                 GROUPS_TABLE_SQL,
                 GROUP_MEMBERS_TABLE_SQL,
                 PAPERS_TABLE_SQL,
-                PAPER_VERSIONS_TABLE_SQL,
                 ANNOTATIONS_TABLE_SQL,
                 TEMPLATES_TABLE_SQL,
                 USER_MESSAGES_TABLE_SQL,

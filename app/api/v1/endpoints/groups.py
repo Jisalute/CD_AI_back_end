@@ -184,20 +184,18 @@ def list_groups(
             (
                 SELECT COUNT(*) FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_type='student' AND gm.is_active=1
             ) AS student_count,
-            (SELECT COUNT(DISTINCT pv.paper_id)
-                FROM paper_versions pv
-                JOIN papers p ON pv.paper_id = p.id
+            (SELECT COUNT(DISTINCT p.id)
+                FROM papers p
                 WHERE p.owner_id IN (
                     SELECT member_id FROM group_members WHERE group_id = g.group_id AND member_type='student' AND is_active=1
-                ) AND pv.status = '待审阅'
+                ) AND p.status = '待审阅'
             ) AS pending_papers,
             (
-                SELECT COUNT(DISTINCT pv2.paper_id)
-                FROM paper_versions pv2
-                JOIN papers p2 ON pv2.paper_id = p2.id
+                SELECT COUNT(DISTINCT p2.id)
+                FROM papers p2
                 WHERE p2.owner_id IN (
                     SELECT member_id FROM group_members WHERE group_id = g.group_id AND member_type='student' AND is_active=1
-                ) AND pv2.status = '已审阅'
+                ) AND p2.status = '已审阅'
             ) AS reviewed_papers
         FROM `groups` g
         WHERE EXISTS (
@@ -1032,9 +1030,9 @@ async def get_class_students(
             s.name as student_name,
             s.student_id as student_number,
             p.id as paper_id,
-            pv.version as paper_version,
-            pv.status as paper_status,
-            pv.updated_at as paper_update_time,
+            p.version as paper_version,
+            p.status as paper_status,
+            p.updated_at as paper_update_time,
             (SELECT COUNT(*) FROM annotations WHERE paper_id = p.id) as annotation_count
         FROM
             students s
@@ -1042,13 +1040,12 @@ async def get_class_students(
             group_members gm ON s.id = gm.member_id AND gm.member_type = 'student' AND gm.is_active = 1
         LEFT JOIN
             papers p ON s.id = p.owner_id
-        LEFT JOIN
-            paper_versions pv ON p.id = pv.paper_id
+        
         WHERE
             gm.group_id = %s
         ORDER BY
             s.name ASC,
-            pv.updated_at DESC
+            p.updated_at DESC
         """
         
         cursor.execute(sql, (group_id,))
@@ -1169,9 +1166,9 @@ async def get_group_papers(
             s.name as student_name,
             s.student_id as student_number,
             p.id as paper_id,
-            pv.version as paper_version,
-            pv.status as paper_status,
-            pv.updated_at as paper_update_time,
+            p.version as paper_version,
+            p.status as paper_status,
+            p.updated_at as paper_update_time,
             (SELECT COUNT(*) FROM annotations WHERE paper_id = p.id) as annotation_count
         FROM
             students s
@@ -1179,13 +1176,12 @@ async def get_group_papers(
             group_members gm ON s.id = gm.member_id AND gm.member_type = 'student' AND gm.is_active = 1
         LEFT JOIN
             papers p ON s.id = p.owner_id
-        LEFT JOIN
-            paper_versions pv ON p.id = pv.paper_id
+        
         WHERE
             gm.group_id = %s
         ORDER BY
             s.name ASC,
-            pv.updated_at DESC
+            p.updated_at DESC
         """
         
         cursor.execute(sql, (group_id,))
@@ -1282,21 +1278,20 @@ async def batch_download_papers(
             s.student_id as student_number,
             p.id as paper_id,
             p.oss_key as oss_key,
-            pv.version as paper_version,
-            pv.status as paper_status
+            p.version as paper_version,
+            p.status as paper_status
         FROM
             students s
         JOIN
             group_members gm ON s.id = gm.member_id AND gm.member_type = 'student' AND gm.is_active = 1
         LEFT JOIN
             papers p ON s.id = p.owner_id
-        LEFT JOIN
-            paper_versions pv ON p.id = pv.paper_id
+        
         WHERE
             {where_clause}
         ORDER BY
             s.name ASC,
-            pv.updated_at DESC
+            p.updated_at DESC
         """
         
         cursor.execute(sql, params)

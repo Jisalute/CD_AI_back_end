@@ -108,16 +108,29 @@ async def upload_paper(
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         version = "v1.0"
         paper_sql = """
-        INSERT INTO papers (owner_id, teacher_id, latest_version, oss_key, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO papers (
+            owner_id, teacher_id, latest_version, version, size, status, oss_key,
+            submitted_by_name, submitted_by_role, created_at, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
-        cursor.execute(paper_sql, (owner_id, teacher_id, version, oss_key, now, now))
-        paper_id = cursor.lastrowid 
-        version_sql = """
-        INSERT INTO paper_versions (paper_id, teacher_id, version, size, created_at, status, submitted_by_id, submitted_by_name, submitted_by_role)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        cursor.execute(version_sql, (paper_id, teacher_id, version, size, now, "已上传", submitter_id, submitter_name, submitter_role))
+        cursor.execute(
+            paper_sql,
+            (
+                owner_id,
+                teacher_id,
+                version,
+                version,
+                size,
+                "已上传",
+                oss_key,
+                submitter_name,
+                submitter_role,
+                now,
+                now,
+            ),
+        )
+        paper_id = cursor.lastrowid
         db.commit()
     except pymysql.MySQLError as e:
         db.rollback() 
@@ -179,17 +192,31 @@ async def update_paper(
         cursor.execute(
             """
             UPDATE papers
-            SET latest_version = %s, oss_key = %s, updated_at = %s
+            SET latest_version = %s,
+                version = %s,
+                size = %s,
+                status = %s,
+                submitted_by_name = %s,
+                submitted_by_role = %s,
+                oss_key = %s,
+                updated_at = %s,
+                operated_by = %s,
+                operated_time = %s
             WHERE id = %s
             """,
-            (version, oss_key, now, paper_id),
-        )
-        cursor.execute(
-            """
-            INSERT INTO paper_versions (paper_id, teacher_id, version, size, created_at, updated_at, status, submitted_by_id, submitted_by_name, submitted_by_role)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (paper_id, teacher_id, version, size, now, now, "已更新", submitter_id, submitter_name, submitter_role),
+            (
+                version,
+                version,
+                size,
+                "已更新",
+                submitter_name,
+                submitter_role,
+                oss_key,
+                now,
+                submitter_name,
+                now,
+                paper_id,
+            ),
         )
         db.commit()
         return PaperOut(id=paper_id, owner_id=paper_owner_id, teacher_id=teacher_id, latest_version=version, oss_key=oss_key)
@@ -232,7 +259,6 @@ def delete_paper(
                 status_code=403,
                 detail=f"无权限删除该论文：仅论文归属者（ID={paper_owner_id}）或管理员可删除，当前登录用户ID={current_id}，角色={current_roles}"
             )
-        cursor.execute("DELETE FROM paper_versions WHERE paper_id = %s", (paper_id,))
         cursor.execute("DELETE FROM papers WHERE id = %s", (paper_id,))
         db.commit()
         delete_type = "归属者" if is_owner else "管理员"
@@ -284,29 +310,15 @@ def create_paper_status(
             raise HTTPException(status_code=404, detail="论文不存在")
         student_id, teacher_id, version = paper_info 
         cursor.execute(
-            "SELECT status FROM paper_versions WHERE paper_id = %s AND version = %s ORDER BY updated_at DESC LIMIT 1",
-            (paper_id, version),
+            "SELECT status, size FROM papers WHERE id = %s",
+            (paper_id,),
         )
         current_status_row = cursor.fetchone()
-        has_valid_history = False
-        if current_status_row:
-            current_status = current_status_row[0]
-            if current_status != "已上传":
-                raise HTTPException(status_code=400, detail=f"当前论文版本状态为【{current_status}】，仅状态为【已上传】时可创建待审阅状态")
-            cursor.execute(
-                """
-                SELECT status FROM paper_versions 
-                WHERE paper_id = %s AND version = %s AND status NOT IN ('已上传')
-                ORDER BY updated_at DESC LIMIT 1
-                """,
-                (paper_id, version),
-            )
-            valid_history = cursor.fetchone()
-            if valid_history:
-                has_valid_history = True
-        
-        if has_valid_history:
-            raise HTTPException(status_code=409, detail="该论文版本已存在有效状态记录，不可重复创建，可使用更新接口")
+        if not current_status_row:
+            raise HTTPException(status_code=404, detail="论文不存在")
+        current_status, current_size = current_status_row
+        if current_status != "已上传":
+            raise HTTPException(status_code=400, detail=f"当前论文状态为【{current_status}】，仅状态为【已上传】时可创建待审阅状态")
         is_student = (login_user_id == student_id)
         if not is_student:
             raise HTTPException(
@@ -314,15 +326,23 @@ def create_paper_status(
                 detail=f"仅该论文的学生（ID={student_id}）可创建待审阅状态，当前登录用户ID={login_user_id}"
             )
         now = datetime.now()
-        size = 0  
+        size = current_size or 0
         cursor.execute(
             """
-            INSERT INTO paper_versions (
-                paper_id, teacher_id, version, size, created_at, status, submitted_by_id
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            UPDATE papers
+            SET status = %s,
+                operated_by = %s,
+                operated_time = %s,
+                updated_at = %s
+            WHERE id = %s
             """,
-            (paper_id, teacher_id, version, size, now.strftime("%Y-%m-%d %H:%M:%S"), status, login_user_id),
+            (
+                status,
+                current_user.get("username") or str(login_user_id),
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                paper_id,
+            ),
         )
         db.commit()
         return PaperStatusOut(
@@ -377,23 +397,17 @@ def update_paper_status(
         student_id, teacher_id, version = paper_info 
         cursor.execute(
             """
-            SELECT size, status, updated_at FROM paper_versions 
-            WHERE paper_id = %s AND version = %s 
-            ORDER BY updated_at DESC
+            SELECT size, status FROM papers
+            WHERE id = %s
             """,
-            (paper_id, version),
+            (paper_id,),
         )
-        all_status_records = cursor.fetchall()
-        current_status = None
-        original_size = None
-        for record in all_status_records:
-            rec_size, rec_status, rec_time = record
-            if rec_status not in ('已上传'):
-                current_status = rec_status
-                original_size = rec_size
-                break
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="论文不存在")
+        original_size, current_status = row
         if not current_status:
-            raise HTTPException(status_code=404, detail="该论文版本无有效状态记录，请先创建状态")
+            raise HTTPException(status_code=404, detail="该论文无有效状态记录，请先创建状态")
         
         is_student = (login_user_id == student_id)
         is_teacher = (login_user_id == teacher_id)
@@ -441,20 +455,19 @@ def update_paper_status(
         now = datetime.now()
         cursor.execute(
             """
-            INSERT INTO paper_versions (
-                paper_id, teacher_id, version, size, created_at, updated_at, status, submitted_by_id
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            UPDATE papers
+            SET status = %s,
+                operated_by = %s,
+                operated_time = %s,
+                updated_at = %s
+            WHERE id = %s
             """,
             (
-                paper_id,
-                teacher_id,
-                version,
-                original_size,
-                now.strftime("%Y-%m-%d %H:%M:%S"),
-                now.strftime("%Y-%m-%d %H:%M:%S"),
                 status,
-                login_user_id,
+                current_user.get("username") or str(login_user_id),
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                paper_id,
             ),
         )
         
@@ -516,10 +529,9 @@ def list_versions(
         
         # 查询版本表
         version_sql = """
-        SELECT version, size, created_at, status, teacher_id 
-        FROM paper_versions 
-        WHERE paper_id = %s 
-        ORDER BY created_at DESC
+        SELECT version, size, created_at, status, teacher_id
+        FROM papers
+        WHERE id = %s
         """
         cursor.execute(version_sql, (paper_id,))
         versions = cursor.fetchall()
@@ -530,8 +542,7 @@ def list_versions(
                 version=version[0],
                 size=version[1],
                 created_at=version[2].strftime("%Y-%m-%dT%H:%M:%SZ"),  # 格式化时间
-                status=version[3],
-                teacher_id=version[4]
+                status=version[3]
             ))
         return result
     except pymysql.MySQLError as e:
