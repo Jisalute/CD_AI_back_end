@@ -6,7 +6,7 @@ import json
 from app.database import get_db
 from loguru import logger
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import urllib.parse
 import re 
 
@@ -210,6 +210,72 @@ def update_annotation(
             status_code=500,
             detail="标注信息校验失败，请稍后重试"
         )
+    finally:
+        if cursor:
+            cursor.close()
+
+
+@router.get(
+    "/paper",
+    response_model=List[AnnotationOut],
+    summary="获取论文标注",
+    description="根据论文所属用户ID与论文ID查询该论文的所有批注"
+)
+def list_annotations_by_paper(
+    owner_id: int = Query(..., description="论文所属用户ID（papers.owner_id）"),
+    paper_id: int = Query(..., description="论文ID"),
+    current_user: Optional[str] = Query(None, description="登录用户信息(JSON字符串，包含 sub/username/roles)"),
+    db: pymysql.connections.Connection = Depends(get_db)
+):
+    _ = _parse_current_user(current_user)
+    if not isinstance(owner_id, int) or owner_id <= 0:
+        raise HTTPException(status_code=400, detail="owner_id必须是有效正整数")
+
+    cursor = None
+    try:
+        cursor = db.cursor(pymysql.cursors.DictCursor)
+        cursor.execute(
+            """
+            SELECT 1 FROM papers
+            WHERE id = %s AND owner_id = %s
+            """,
+            (paper_id, owner_id)
+        )
+        if not cursor.fetchone():
+            raise HTTPException(
+                status_code=404,
+                detail="论文不存在或论文所属用户ID不匹配"
+            )
+
+        cursor.execute(
+            """
+            SELECT id, paper_id, author_id, paragraph_id, coordinates, content, created_at, updated_at
+            FROM annotations
+            WHERE paper_id = %s
+            ORDER BY created_at ASC
+            """,
+            (paper_id,)
+        )
+        rows = cursor.fetchall() or []
+
+        return [
+            AnnotationOut(
+                id=row["id"],
+                paper_id=row["paper_id"],
+                author_id=row["author_id"],
+                paragraph_id=row.get("paragraph_id"),
+                coordinates=row.get("coordinates"),
+                content=row.get("content"),
+                created_at=row.get("created_at").strftime("%Y-%m-%dT%H:%M:%SZ") if row.get("created_at") else None,
+                updated_at=row.get("updated_at").strftime("%Y-%m-%dT%H:%M:%SZ") if row.get("updated_at") else None,
+            )
+            for row in rows
+        ]
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        logger.error(f"查询标注数据库异常: {str(e)}")
+        raise HTTPException(status_code=500, detail="标注查询失败，请稍后重试")
     finally:
         if cursor:
             cursor.close()

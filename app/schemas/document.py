@@ -36,8 +36,6 @@ class PaperStatusOut(BaseModel):
     status: str
     size: int
     updated_at: str
-from pydantic import BaseModel
-from typing import Optional
 from datetime import datetime
 
 
@@ -48,8 +46,7 @@ class MaterialResponse(BaseModel):
     created_at: datetime
     updated_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 class DDLCreate(BaseModel):
     teacher_id: int
@@ -62,5 +59,4 @@ class DDLOut(BaseModel):
     ddl_time: str
     created_at: Optional[str] = None
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}

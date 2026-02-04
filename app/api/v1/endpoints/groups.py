@@ -841,6 +841,164 @@ async def remove_group_member(group_id: str, payload: GroupMember, current_user:
 
 
 @router.get(
+    "/{group_id}/members",
+    summary="获取群组成员信息",
+    description="获取指定群组成员列表，可按成员类型筛选"
+)
+async def get_group_members(
+    group_id: str,
+    member_type: Optional[str] = Query(None, description="成员类型筛选：student/teacher/admin"),
+    include_inactive: bool = Query(False, description="是否包含已移除成员"),
+    current_user: str = Query('{"sub": 1, "roles": ["admin"], "username": "admin"}', description="当前登录用户信息(JSON字符串)，示例: {\"sub\":1,\"roles\":[\"admin\"],\"username\":\"admin\"}")
+):
+    cu = _parse_current_user(current_user)
+    roles_norm = _normalize_roles(cu.get("roles", []))
+
+    if member_type and member_type not in ["student", "teacher", "admin"]:
+        raise HTTPException(status_code=400, detail="成员类型必须是student、teacher或admin")
+
+    conn = get_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+
+        cursor.execute("SELECT 1 FROM `groups` WHERE `group_id` = %s", (group_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="群组不存在")
+
+        if not ("admin" in roles_norm or "teacher" in roles_norm):
+            cursor.execute(
+                "SELECT 1 FROM `group_members` WHERE `group_id`=%s AND `member_id`=%s AND `is_active`=1",
+                (group_id, cu.get("sub", 0)),
+            )
+            if not cursor.fetchone():
+                raise HTTPException(status_code=403, detail="无权限查看该群组成员")
+
+        active_clause = "" if include_inactive else " AND gm.is_active = 1"
+        members: list[dict] = []
+
+        def _fetch_students():
+            sql = f"""
+            SELECT
+                gm.group_id,
+                gm.member_id,
+                gm.member_type,
+                gm.role,
+                gm.joined_at,
+                gm.updated_at,
+                gm.is_active,
+                s.student_id AS account_id,
+                s.name,
+                s.phone,
+                s.email,
+                s.grade,
+                s.class_name
+            FROM group_members gm
+            JOIN students s ON s.id = gm.member_id
+            WHERE gm.group_id = %s AND gm.member_type = 'student'{active_clause}
+            ORDER BY s.name ASC
+            """
+            cursor.execute(sql, (group_id,))
+            return cursor.fetchall() or []
+
+        def _fetch_teachers():
+            sql = f"""
+            SELECT
+                gm.group_id,
+                gm.member_id,
+                gm.member_type,
+                gm.role,
+                gm.joined_at,
+                gm.updated_at,
+                gm.is_active,
+                t.teacher_id AS account_id,
+                t.name,
+                t.phone,
+                t.email,
+                t.department,
+                t.title
+            FROM group_members gm
+            JOIN teachers t ON t.id = gm.member_id
+            WHERE gm.group_id = %s AND gm.member_type = 'teacher'{active_clause}
+            ORDER BY t.name ASC
+            """
+            cursor.execute(sql, (group_id,))
+            return cursor.fetchall() or []
+
+        def _fetch_admins():
+            sql = f"""
+            SELECT
+                gm.group_id,
+                gm.member_id,
+                gm.member_type,
+                gm.role,
+                gm.joined_at,
+                gm.updated_at,
+                gm.is_active,
+                a.admin_id AS account_id,
+                a.name,
+                a.phone,
+                a.email,
+                a.role AS admin_role
+            FROM group_members gm
+            JOIN admins a ON a.id = gm.member_id
+            WHERE gm.group_id = %s AND gm.member_type = 'admin'{active_clause}
+            ORDER BY a.name ASC
+            """
+            cursor.execute(sql, (group_id,))
+            return cursor.fetchall() or []
+
+        if member_type == "student":
+            members.extend(_fetch_students())
+        elif member_type == "teacher":
+            members.extend(_fetch_teachers())
+        elif member_type == "admin":
+            members.extend(_fetch_admins())
+        else:
+            members.extend(_fetch_students())
+            members.extend(_fetch_teachers())
+            members.extend(_fetch_admins())
+
+        def _fmt_time(val):
+            return val.strftime("%Y-%m-%d %H:%M:%S") if val else None
+
+        return {
+            "group_id": group_id,
+            "member_type": member_type,
+            "include_inactive": include_inactive,
+            "total": len(members),
+            "members": [
+                {
+                    "member_id": m.get("member_id"),
+                    "member_type": m.get("member_type"),
+                    "role": m.get("role"),
+                    "is_active": int(m.get("is_active", 0)) if m.get("is_active") is not None else None,
+                    "joined_at": _fmt_time(m.get("joined_at")),
+                    "updated_at": _fmt_time(m.get("updated_at")),
+                    "account_id": m.get("account_id"),
+                    "name": m.get("name"),
+                    "phone": m.get("phone"),
+                    "email": m.get("email"),
+                    "grade": m.get("grade"),
+                    "class_name": m.get("class_name"),
+                    "department": m.get("department"),
+                    "title": m.get("title"),
+                    "admin_role": m.get("admin_role"),
+                }
+                for m in members
+            ],
+        }
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
+@router.get(
     "/{group_id}/students",
     summary="获取班级学生列表",
     description="获取指定班级的所有学生及其论文状态"

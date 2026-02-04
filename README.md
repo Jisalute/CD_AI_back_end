@@ -147,11 +147,13 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 	- DELETE `/groups/{group_id}`
 	- POST `/groups/{group_id}/members`
 	- DELETE `/groups/{group_id}/members`
+	- GET  `/groups/{group_id}/members`（获取成员信息，支持 member_type 与 include_inactive）
 
 - 标注 Annotations
 	- POST `/annotations/`（为论文创建标注）
 	- PUT `/annotations/{annotation_id}`（更新标注）
 	- DELETE `/annotations/{annotation_id}`（删除标注）
+	- GET  `/annotations/paper`（按 owner_id 与 paper_id 查询批注）
 
 - 管理 Admin
 	- POST `/admin/templates`（上传模板并存储元数据）
