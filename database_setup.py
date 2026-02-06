@@ -201,6 +201,31 @@ CREATE TABLE IF NOT EXISTS `papers` (
 """
 
 
+PAPERS_HISTORY_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS `papers_history` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '历史版本ID',
+    `paper_id` INT NOT NULL COMMENT '论文ID',
+    `version` VARCHAR(20) NOT NULL COMMENT '历史版本号',
+    `size` INT NOT NULL COMMENT '文件大小（字节）',
+    `status` VARCHAR(32) NOT NULL COMMENT '状态（如uploaded, processing, completed等）',
+    `detail` TEXT COMMENT '状态描述',
+    `oss_key` VARCHAR(255) NOT NULL COMMENT 'OSS存储键',
+    `submitted_by_id` VARCHAR(64) DEFAULT NULL COMMENT '提交者ID',
+    `submitted_by_name` VARCHAR(128) DEFAULT NULL COMMENT '提交者姓名',
+    `submitted_by_role` VARCHAR(64) DEFAULT NULL COMMENT '提交者角色',
+    `operated_by` VARCHAR(64) DEFAULT NULL COMMENT '操作人',
+    `operated_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '操作时间',
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+    PRIMARY KEY (`id`),
+    KEY `idx_papers_history_paper_id` (`paper_id`),
+    KEY `idx_papers_history_version` (`version`),
+    KEY `idx_papers_history_status` (`status`),
+    KEY `idx_papers_history_created_at` (`created_at`),
+    CONSTRAINT `fk_papers_history_paper_id` FOREIGN KEY (`paper_id`) REFERENCES `papers` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='论文历史版本表';
+"""
+
+
 ANNOTATIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS `annotations` (
     `id` INT NOT NULL AUTO_INCREMENT COMMENT '批注ID',
@@ -318,6 +343,7 @@ def init_db(database_url: str | None = None) -> None:
                 GROUPS_TABLE_SQL,
                 GROUP_MEMBERS_TABLE_SQL,
                 PAPERS_TABLE_SQL,
+                PAPERS_HISTORY_TABLE_SQL,
                 ANNOTATIONS_TABLE_SQL,
                 TEMPLATES_TABLE_SQL,
                 USER_MESSAGES_TABLE_SQL,
@@ -326,7 +352,7 @@ def init_db(database_url: str | None = None) -> None:
                 cur.execute(sql)
         print(
             "Tables ensured: students, teachers, admins, file_records, groups, group_members, "
-            "papers, annotations, templates, user_messages, operation_logs"
+            "papers, papers_history, annotations, templates, user_messages, operation_logs"
         )
     finally:
         conn.close()
@@ -435,6 +461,22 @@ TABLE_COLUMN_DEFINITIONS = {
         "created_at": "`created_at` DATETIME NOT NULL COMMENT '创建时间'",
         "updated_at": "`updated_at` DATETIME NOT NULL COMMENT '更新时间'",
     },
+    "papers_history": {
+        "id": "`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY",
+        "paper_id": "`paper_id` INT NOT NULL COMMENT '论文ID'",
+        "version": "`version` VARCHAR(20) NOT NULL COMMENT '历史版本号'",
+        "size": "`size` INT NOT NULL COMMENT '文件大小（字节）'",
+        "status": "`status` VARCHAR(32) NOT NULL COMMENT '状态（如uploaded, processing, completed等）'",
+        "detail": "`detail` TEXT COMMENT '状态描述'",
+        "oss_key": "`oss_key` VARCHAR(255) NOT NULL COMMENT 'OSS存储键'",
+        "submitted_by_id": "`submitted_by_id` VARCHAR(64) DEFAULT NULL COMMENT '提交者ID'",
+        "submitted_by_name": "`submitted_by_name` VARCHAR(128) DEFAULT NULL COMMENT '提交者姓名'",
+        "submitted_by_role": "`submitted_by_role` VARCHAR(64) DEFAULT NULL COMMENT '提交者角色'",
+        "operated_by": "`operated_by` VARCHAR(64) DEFAULT NULL COMMENT '操作人'",
+        "operated_time": "`operated_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '操作时间'",
+        "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间'",
+        "updated_at": "`updated_at` DATETIME NOT NULL COMMENT '更新时间'",
+    },
     "annotations": {
         "id": "`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY",
         "paper_id": "`paper_id` INT NOT NULL COMMENT '所属论文ID'",
@@ -525,6 +567,12 @@ TABLE_INDEX_DEFINITIONS = {
         "CREATE INDEX idx_version ON `papers` (version)",
         "CREATE INDEX idx_status ON `papers` (status)"
     ],
+    "papers_history": [
+        "CREATE INDEX idx_papers_history_paper_id ON `papers_history` (paper_id)",
+        "CREATE INDEX idx_papers_history_version ON `papers_history` (version)",
+        "CREATE INDEX idx_papers_history_status ON `papers_history` (status)",
+        "CREATE INDEX idx_papers_history_created_at ON `papers_history` (created_at)"
+    ],
     "annotations": [
         "CREATE INDEX idx_annotations_paper_id ON `annotations` (paper_id)",
         "CREATE INDEX idx_annotations_author_id ON `annotations` (author_id)"
@@ -570,6 +618,7 @@ def sync_schema(database_url: str | None = None) -> None:
                 GROUPS_TABLE_SQL,
                 GROUP_MEMBERS_TABLE_SQL,
                 PAPERS_TABLE_SQL,
+                PAPERS_HISTORY_TABLE_SQL,
                 ANNOTATIONS_TABLE_SQL,
                 TEMPLATES_TABLE_SQL,
                 USER_MESSAGES_TABLE_SQL,

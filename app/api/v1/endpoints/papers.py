@@ -527,11 +527,12 @@ def list_versions(
                 detail=f"无权限查看该论文版本：仅论文归属者（ID={paper_owner_id}）、关联老师（ID={paper_teacher_id}）或管理员可查看，当前登录用户ID={submitter_id}，角色={current_roles}"
             )
         
-        # 查询版本表
+        # 查询历史版本表
         version_sql = """
-        SELECT version, size, created_at, status, teacher_id
-        FROM papers
-        WHERE id = %s
+        SELECT version, size, created_at, status
+        FROM papers_history
+        WHERE paper_id = %s
+        ORDER BY created_at DESC
         """
         cursor.execute(version_sql, (paper_id,))
         versions = cursor.fetchall()
@@ -550,7 +551,7 @@ def list_versions(
     finally:
         if cursor:
             cursor.close()
-    return [VersionOut(version="v1.0", size=12345, created_at="2025-01-01T00:00:00Z", status="正常")]
+    return []
 
 
 @router.get(

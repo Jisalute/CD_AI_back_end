@@ -2,3 +2,6 @@
 __pycache__/
 logs/
 .vscode/
+doc/essay/
+doc/attachment/
+doc/template/
