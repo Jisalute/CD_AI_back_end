@@ -208,7 +208,7 @@ def list_groups(
 
         like_value = f"%{keyword}%" if keyword else "%"
         offset = (page - 1) * page_size
-        cursor.execute(list_sql, (like_value, like_value, teacher_internal_id, page_size, offset))
+        cursor.execute(list_sql, (teacher_internal_id, like_value, like_value, page_size, offset))
         rows = cursor.fetchall()
 
         # count total matching groups for pagination
@@ -1030,8 +1030,7 @@ async def get_class_students(
             s.name as student_name,
             s.student_id as student_number,
             p.id as paper_id,
-            p.version as paper_version,
-            p.status as paper_status,
+            p.latest_version as paper_version,
             p.updated_at as paper_update_time,
             (SELECT COUNT(*) FROM annotations WHERE paper_id = p.id) as annotation_count
         FROM
@@ -1079,7 +1078,6 @@ async def get_class_students(
                     student_info["papers"].append({
                         "paper_id": paper_id,
                         "paper_version": f"v{paper_info.get('paper_version', 1)}",
-                        "paper_status": paper_info.get('paper_status'),
                         "paper_update_time": paper_info.get('paper_update_time').strftime("%Y-%m-%d %H:%M:%S") if paper_info.get('paper_update_time') else None,
                         "annotation_count": paper_info.get('annotation_count', 0)
                     })
@@ -1166,8 +1164,7 @@ async def get_group_papers(
             s.name as student_name,
             s.student_id as student_number,
             p.id as paper_id,
-            p.version as paper_version,
-            p.status as paper_status,
+            p.latest_version as paper_version,
             p.updated_at as paper_update_time,
             (SELECT COUNT(*) FROM annotations WHERE paper_id = p.id) as annotation_count
         FROM
@@ -1206,7 +1203,6 @@ async def get_group_papers(
                 "student_name": paper_info.get('student_name'),
                 "student_number": paper_info.get('student_number'),
                 "paper_version": f"v{paper_info.get('paper_version', 1)}",
-                "paper_status": paper_info.get('paper_status'),
                 "paper_update_time": paper_info.get('paper_update_time').strftime("%Y-%m-%d %H:%M:%S") if paper_info.get('paper_update_time') else None,
                 "annotation_count": paper_info.get('annotation_count', 0)
             })
@@ -1278,8 +1274,7 @@ async def batch_download_papers(
             s.student_id as student_number,
             p.id as paper_id,
             p.oss_key as oss_key,
-            p.version as paper_version,
-            p.status as paper_status
+            p.latest_version as paper_version
         FROM
             students s
         JOIN
