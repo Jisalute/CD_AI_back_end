@@ -118,6 +118,24 @@ def _ensure_caller_identity(cursor, cu: dict) -> None:
     raise HTTPException(status_code=403, detail="当前用户在系统中不存在或其身份与数据库不符")
 
 
+def _ensure_caller_is_group_owner(cursor, group_id: str, caller_id: int) -> None:
+    cursor.execute(
+        """
+        SELECT 1 FROM `group_members` 
+        WHERE `group_id`=%s AND `member_id`=%s AND `role`='owner' AND `is_active`=1
+        """,
+        (group_id, caller_id)
+    )
+    if not cursor.fetchone():
+        raise HTTPException(status_code=403, detail="仅该群组的群主可设置管理员教师")
+
+
+def _validate_teacher_exists(cursor, teacher_id: int) -> None:
+    cursor.execute("SELECT 1 FROM `teachers` WHERE `id` = %s", (teacher_id,))
+    if not cursor.fetchone():
+        raise HTTPException(status_code=404, detail=f"教师ID {teacher_id} 不存在")
+
+
 @router.get(
     "/",
     summary="获取群组列表",
@@ -1324,6 +1342,261 @@ async def batch_download_papers(
         }
     except HTTPException:
         raise
+    except pymysql.MySQLError as e:
+        raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
+@router.post(
+    "/{group_id}/set-teacher-admin",
+    summary="设置群组管理员教师",
+    description="仅群组群主可调用，为指定群组设置管理员教师（将教师添加为群组admin角色）"
+)
+async def set_group_teacher_admin(
+    group_id: str,
+    teacher_internal_id: int = Query(..., description="教师内部ID（数据库teachers表的id）"),
+    current_user: Optional[str] = Query(None, description="当前登录用户信息(JSON字符串)，示例: {\"sub\":1,\"roles\":[\"admin\"],\"username\":\"admin\"}"),
+):
+    cu = _parse_current_user(current_user)
+    caller_id = cu.get("sub", 0)
+    if not caller_id:
+        raise HTTPException(status_code=403, detail="无效的用户身份信息")
+
+    conn = get_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        cursor.execute("SELECT 1 FROM `groups` WHERE `group_id` = %s", (group_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail=f"群组ID {group_id} 不存在")
+        _ensure_caller_is_group_owner(cursor, group_id, caller_id)
+        _validate_teacher_exists(cursor, teacher_internal_id)
+        cursor.execute(
+            """
+            INSERT INTO `group_members` 
+            (`group_id`, `member_id`, `member_type`, `role`, `is_active`, `joined_at`, `updated_at`)
+            VALUES (%s, %s, 'teacher', 'admin', 1, NOW(), NOW())
+            ON DUPLICATE KEY UPDATE 
+            `role` = 'admin', 
+            `is_active` = 1, 
+            `updated_at` = NOW()
+            """,
+            (group_id, teacher_internal_id)
+        )
+        
+        conn.commit()
+        logger.info(f"群组 {group_id} 群主 {caller_id} 将教师 {teacher_internal_id} 设置为群组管理员")
+        
+        return {
+            "group_id": group_id,
+            "teacher_internal_id": teacher_internal_id,
+            "role": "admin",
+            "message": "成功将该教师设置为群组管理员"
+        }
+    
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        conn.rollback()
+        logger.error(f"设置群组管理员教师失败：数据库错误 {str(e)}")
+        raise HTTPException(status_code=500, detail=f"数据库操作失败：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
+@router.get(
+    "/paper/reviewed/count",
+    summary="查看已审阅论文数",
+    description="查询指定群组下已审阅论文数量（状态：已审阅、已更新、已定稿、待更新），仅群组群主/管理员教师可访问"
+)
+def get_reviewed_paper_count(
+    group_id: str = Query(..., description="群组ID"),
+    current_user: Optional[str] = Header(None, alias="X-Current-User", description="当前登录用户信息(JSON字符串)，示例: {\"sub\":1,\"roles\":[\"teacher\"],\"username\":\"teacher1\"}"),
+):
+    cu = _parse_current_user(current_user)
+    caller_id = cu.get("sub", 0)
+    roles_norm = _normalize_roles(cu.get("roles", []))
+    
+    conn = get_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        _ensure_caller_identity(cursor, cu)
+        cursor.execute(
+            """
+            SELECT 1 FROM `group_members` 
+            WHERE `group_id`=%s AND `member_id`=%s 
+            AND (`role`='owner' OR `role`='admin') 
+            AND `member_type` IN ('teacher', 'admin') 
+            AND `is_active`=1
+            """,
+            (group_id, caller_id)
+        )
+        if not cursor.fetchone():
+            raise HTTPException(status_code=403, detail="仅该群组的群主或管理员教师可查看已审阅论文数")
+        count_sql = """
+        SELECT COUNT(DISTINCT p.id) AS count
+        FROM `papers` p
+        WHERE p.owner_id IN (
+            SELECT member_id FROM group_members 
+            WHERE group_id = %s AND member_type='student' AND is_active=1
+        ) 
+        AND p.status IN ('已审阅', '已更新', '已定稿', '待更新')
+        """
+        cursor.execute(count_sql, (group_id,))
+        count_row = cursor.fetchone()
+        count = int(count_row["count"]) if count_row else 0
+        
+        return {
+            "group_id": group_id,
+            "reviewed_paper_count": count,
+            "message": "已成功查询已审阅论文数"
+        }
+    except pymysql.MySQLError as e:
+        raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
+@router.get(
+    "/paper/uploaded/count",
+    summary="查看已上传论文数",
+    description="查询指定群组下已上传论文数量（状态：已上传、待审阅），仅群组群主/管理员教师可访问"
+)
+def get_uploaded_paper_count(
+    group_id: str = Query(..., description="群组ID"),
+    current_user: Optional[str] = Header(None, alias="X-Current-User", description="当前登录用户信息(JSON字符串)，示例: {\"sub\":1,\"roles\":[\"teacher\"],\"username\":\"teacher1\"}"),
+):
+    cu = _parse_current_user(current_user)
+    caller_id = cu.get("sub", 0)
+    roles_norm = _normalize_roles(cu.get("roles", []))
+    
+    conn = get_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        _ensure_caller_identity(cursor, cu)
+        cursor.execute(
+            """
+            SELECT 1 FROM `group_members` 
+            WHERE `group_id`=%s AND `member_id`=%s 
+            AND (`role`='owner' OR `role`='admin') 
+            AND `member_type` IN ('teacher', 'admin') 
+            AND `is_active`=1
+            """,
+            (group_id, caller_id)
+        )
+        if not cursor.fetchone():
+            raise HTTPException(status_code=403, detail="仅该群组的群主或管理员教师可查看已上传论文数")
+        count_sql = """
+        SELECT COUNT(DISTINCT p.id) AS count
+        FROM `papers` p
+        WHERE p.owner_id IN (
+            SELECT member_id FROM group_members 
+            WHERE group_id = %s AND member_type='student' AND is_active=1
+        ) 
+        AND p.status IN ('已上传', '待审阅')
+        """
+        cursor.execute(count_sql, (group_id,))
+        count_row = cursor.fetchone()
+        count = int(count_row["count"]) if count_row else 0
+        
+        return {
+            "group_id": group_id,
+            "uploaded_paper_count": count,
+            "message": "已成功查询已上传论文数"
+        }
+    except pymysql.MySQLError as e:
+        raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
+        conn.close()
+
+
+@router.get(
+    "/paper/unuploaded/members",
+    summary="查看未上传论文的成员",
+    description="查询指定群组下未上传论文的学生成员列表，仅群组群主/管理员教师可访问"
+)
+def get_unuploaded_paper_members(
+    group_id: str = Query(..., description="群组ID"),
+    current_user: Optional[str] = Header(None, alias="X-Current-User", description="当前登录用户信息(JSON字符串)，示例: {\"sub\":1,\"roles\":[\"teacher\"],\"username\":\"teacher1\"}"),
+):
+    cu = _parse_current_user(current_user)
+    caller_id = cu.get("sub", 0)
+    roles_norm = _normalize_roles(cu.get("roles", []))
+    
+    conn = get_connection()
+    cursor = None
+    try:
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        _ensure_caller_identity(cursor, cu)
+        cursor.execute(
+            """
+            SELECT 1 FROM `group_members` 
+            WHERE `group_id`=%s AND `member_id`=%s 
+            AND (`role`='owner' OR `role`='admin') 
+            AND `member_type` IN ('teacher', 'admin') 
+            AND `is_active`=1
+            """,
+            (group_id, caller_id)
+        )
+        if not cursor.fetchone():
+            raise HTTPException(status_code=403, detail="仅该群组的群主或管理员教师可查看未上传论文成员")
+        cursor.execute(
+            """
+            SELECT gm.member_id, s.student_id, s.name 
+            FROM `group_members` gm
+            LEFT JOIN `students` s ON gm.member_id = s.id
+            WHERE gm.group_id = %s 
+            AND gm.member_type = 'student' 
+            AND gm.is_active = 1
+            """,
+            (group_id,)
+        )
+        all_students = cursor.fetchall()
+        if not all_students:
+            return {
+                "group_id": group_id,
+                "unuploaded_members": [],
+                "message": "该群组暂无学生成员"
+            }
+        cursor.execute(
+            """
+            SELECT DISTINCT p.owner_id 
+            FROM `papers` p
+            WHERE p.owner_id IN (
+                SELECT member_id FROM group_members 
+                WHERE group_id = %s AND member_type='student' AND is_active=1
+            ) 
+            AND p.status IN ('已上传', '待审阅')
+            """,
+            (group_id,)
+        )
+        uploaded_student_ids = [row["owner_id"] for row in cursor.fetchall()]
+        unuploaded_members = [
+            {
+                "student_internal_id": student["member_id"],
+                "student_id": student["student_id"],  # 学生学号
+                "student_name": student["name"]       # 学生姓名
+            }
+            for student in all_students
+            if student["member_id"] not in uploaded_student_ids
+        ]
+        return {
+            "group_id": group_id,
+            "unuploaded_members_count": len(unuploaded_members),
+            "unuploaded_members": unuploaded_members,
+            "message": "已成功查询未上传论文的成员列表"
+        }
     except pymysql.MySQLError as e:
         raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
     finally:
