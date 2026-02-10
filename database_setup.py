@@ -224,6 +224,24 @@ CREATE TABLE IF NOT EXISTS `papers_history` (
 """
 
 
+PAPER_REVIEWS_TABLE_SQL = """
+CREATE TABLE paper_reviews (
+    id INT AUTO_INCREMENT PRIMARY KEY COMMENT '审阅记录ID',
+    paper_id INT NOT NULL COMMENT '论文ID',
+    teacher_id INT NOT NULL COMMENT '教师ID',
+    review_content TEXT NOT NULL COMMENT '审阅内容',
+    review_time DATETIME NOT NULL COMMENT '审阅时间',
+    updated_time DATETIME DEFAULT NULL COMMENT '更新时间',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
+    -- 索引优化
+    INDEX idx_paper_id (paper_id),
+    INDEX idx_teacher_id (teacher_id),
+    INDEX idx_paper_teacher (paper_id, teacher_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='论文审阅内容表';
+"""
+
+
 ANNOTATIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS `annotations` (
     `id` INT NOT NULL AUTO_INCREMENT COMMENT '批注ID',
