@@ -23,6 +23,14 @@ class UserBindGroup(BaseModel):
     group_id: int
     is_bind: bool = True  
 
+class UserBindSchool(BaseModel):
+    school_id: int
+    school_name: Optional[str] = None 
+
+class UserBindDepartment(BaseModel):
+    department_id: int
+    department_name: Optional[str] = None 
+
 router = APIRouter()
 SUPPORTED_IMPORT_EXTS = (".csv", ".tsv")
 
@@ -618,6 +626,107 @@ def bind_group(user_id: int, payload: UserBindGroup, db: pymysql.connections.Con
         db.rollback()
         logger.error(f"绑定群组数据库错误: {str(e)}")
         raise HTTPException(status_code=500, detail="绑定群组失败")
+    finally:
+        if cursor:
+            cursor.close()
+
+
+@router.put(
+    "/{user_id}/bind-school",
+    response_model=UserOut,
+    summary="绑定用户学校",
+    description="为指定用户绑定/更新所属学校信息"
+)
+def bind_school(
+    user_id: int,
+    payload: UserBindSchool,
+    db: pymysql.connections.Connection = Depends(get_db),
+    user_type: str = Query("admin"),
+):
+    cursor = None
+    try:
+        cursor = db.cursor(pymysql.cursors.DictCursor)
+        user_type = _normalize_user_type(user_type)
+        table = USER_TABLES[user_type]["table"]
+        cursor.execute(f"SELECT id FROM {table} WHERE id = %s", (user_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="用户不存在")
+        cursor.execute("SELECT 1 FROM schools WHERE school_id = %s", (payload.school_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="学校不存在")
+        update_fields = ["school_id = %s", "updated_at = NOW()"]
+        update_params = [payload.school_id]
+        if payload.school_name:
+            update_fields.append("school_name = %s")
+            update_params.append(payload.school_name.strip())
+        
+        update_params.append(user_id)
+        cursor.execute(
+            f"UPDATE {table} SET {', '.join(update_fields)} WHERE id = %s",
+            tuple(update_params)
+        )
+        db.commit()
+        updated = _fetch_user(cursor, user_id, user_type)
+        if not updated:
+            raise HTTPException(status_code=500, detail="绑定学校后查询用户信息失败")
+        return UserOut(**updated)
+    
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        db.rollback()
+        logger.error(f"绑定学校数据库错误: {str(e)}")
+        raise HTTPException(status_code=500, detail="绑定学校失败")
+    finally:
+        if cursor:
+            cursor.close()
+
+@router.put(
+    "/{user_id}/bind-department",
+    response_model=UserOut,
+    summary="绑定用户院系",
+    description="为指定用户绑定/更新所属院系信息"
+)
+def bind_department(
+    user_id: int,
+    payload: UserBindDepartment,
+    db: pymysql.connections.Connection = Depends(get_db),
+    user_type: str = Query("admin"),
+):
+    cursor = None
+    try:
+        cursor = db.cursor(pymysql.cursors.DictCursor)
+        user_type = _normalize_user_type(user_type)
+        table = USER_TABLES[user_type]["table"]
+        cursor.execute(f"SELECT id FROM {table} WHERE id = %s", (user_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="用户不存在")
+        cursor.execute("SELECT 1 FROM departments WHERE department_id = %s", (payload.department_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="院系不存在")
+        update_fields = ["department_id = %s", "updated_at = NOW()"]
+        update_params = [payload.department_id]
+        if payload.department_name:
+            update_fields.append("department_name = %s")
+            update_params.append(payload.department_name.strip())
+        
+        update_params.append(user_id)
+        cursor.execute(
+            f"UPDATE {table} SET {', '.join(update_fields)} WHERE id = %s",
+            tuple(update_params)
+        )
+        db.commit()
+        updated = _fetch_user(cursor, user_id, user_type)
+        if not updated:
+            raise HTTPException(status_code=500, detail="绑定院系后查询用户信息失败")
+        return UserOut(**updated)
+    
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        db.rollback()
+        logger.error(f"绑定院系数据库错误: {str(e)}")
+        raise HTTPException(status_code=500, detail="绑定院系失败")
     finally:
         if cursor:
             cursor.close()
