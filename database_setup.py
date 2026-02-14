@@ -180,22 +180,23 @@ CREATE TABLE IF NOT EXISTS `papers` (
     `latest_version` VARCHAR(20) NOT NULL COMMENT '最新版本号',
     `version` VARCHAR(20) NOT NULL COMMENT '当前版本号',
     `size` INT NOT NULL COMMENT '文件大小（字节）',
-    `status` VARCHAR(32) NOT NULL COMMENT '状态（如uploaded, processing, completed等）',
+    `status` VARCHAR(32) NOT NULL COMMENT '状态（uploaded:已上传, processing:处理中, completed:完成, rejected:驳回）',
     `detail` TEXT COMMENT '状态描述',
     `ddl` DATETIME DEFAULT NULL COMMENT '截止时间',
-    `oss_key` VARCHAR(255) NOT NULL COMMENT 'OSS存储键',
+    `oss_key` VARCHAR(128) NOT NULL COMMENT 'OSS存储键',
     `submitted_by_name` VARCHAR(128) DEFAULT NULL COMMENT '提交者姓名',
     `submitted_by_role` VARCHAR(64) DEFAULT NULL COMMENT '提交者角色',
     `operated_by` VARCHAR(64) DEFAULT NULL COMMENT '操作人',
     `operated_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '操作时间',
-    `created_at` DATETIME NOT NULL COMMENT '创建时间',
-    `updated_at` DATETIME NOT NULL COMMENT '更新时间',
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     PRIMARY KEY (`id`),
     KEY `idx_owner_id` (`owner_id`),
     KEY `idx_teacher_id` (`teacher_id`),
     KEY `idx_version` (`version`),
-    KEY `idx_status` (`status`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='论文信息表';
+    KEY `idx_status` (`status`),
+    KEY `idx_operated_time` (`operated_time`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='论文信息表';
 """
 
 
