@@ -20,7 +20,14 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         )
         
         # 处理请求
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            logger.exception(
+                f"请求处理异常: {request.method} {request.url.path} - "
+                f"客户端: {request.client.host if request.client else 'Unknown'}"
+            )
+            raise
         
         # 计算处理时间
         process_time = time.time() - start_time

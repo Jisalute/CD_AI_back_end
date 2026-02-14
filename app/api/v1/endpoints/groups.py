@@ -263,6 +263,7 @@ def list_groups(
             "total_pages": (total + page_size - 1) // page_size,
         }
     except pymysql.MySQLError as e:
+        logger.exception("群组列表查询数据库异常")
         raise HTTPException(status_code=500, detail=f"数据库错误：{str(e)}")
     finally:
         if cursor:
