@@ -48,3 +48,15 @@ class UserBindPhone(BaseModel):
 
 class UserBindEmail(BaseModel):
     email: EmailStr
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    user_type: Optional[Literal["student", "teacher", "admin"]] = None
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserOut

@@ -15,9 +15,12 @@ from app.schemas.user import (
     UserOut,
     UserBindPhone,
     UserBindEmail,
+    LoginRequest,
+    LoginResponse,
 )
 from app.database import get_db
-from app.core.security import get_password_hash
+from app.core.dependencies import get_current_user
+from app.core.security import create_access_token, get_password_hash, verify_password
 from loguru import logger
 
 
@@ -93,6 +96,62 @@ USER_TABLES = {
 }
 
 
+def _resolve_user_type_from_payload(payload: dict) -> str:
+    user_type = (payload.get("user_type") or "").strip().lower()
+    if user_type in USER_TABLES:
+        return user_type
+    roles = payload.get("roles") or []
+    if isinstance(roles, str):
+        roles = [roles]
+    role_set = {str(role).strip().lower() for role in roles}
+    if "admin" in role_set or "管理员" in role_set:
+        return "admin"
+    if "teacher" in role_set or "教师" in role_set:
+        return "teacher"
+    if "student" in role_set or "学生" in role_set:
+        return "student"
+    raise HTTPException(status_code=400, detail="无法识别用户类型")
+
+
+def _fetch_user_for_login(
+    cursor: pymysql.cursors.Cursor,
+    username: str,
+    user_type: str,
+) -> dict | None:
+    user_type = _normalize_user_type(user_type)
+    info = USER_TABLES[user_type]
+    table = info["table"]
+    id_col = info["id_col"]
+    if user_type == "admin":
+        cursor.execute(
+            f"""
+            SELECT id, {id_col} as username, name as full_name, phone, email, role,
+                   password,
+                   DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') as created_at,
+                   DATE_FORMAT(updated_at, '%%Y-%%m-%%d %%H:%%i:%%s') as updated_at
+            FROM {table} WHERE {id_col} = %s
+            """,
+            (username,),
+        )
+    else:
+        cursor.execute(
+            f"""
+            SELECT id, {id_col} as username, name as full_name, phone, email,
+                   password,
+                   DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') as created_at,
+                   DATE_FORMAT(updated_at, '%%Y-%%m-%%d %%H:%%i:%%s') as updated_at
+            FROM {table} WHERE {id_col} = %s
+            """,
+            (username,),
+        )
+    row = cursor.fetchone()
+    if not row:
+        return None
+    if user_type != "admin":
+        row["role"] = user_type
+    return row
+
+
 def _normalize_user_type(user_type: str | None) -> str:
     value = (user_type or "admin").strip().lower()
     if value not in USER_TABLES:
@@ -158,6 +217,105 @@ def _fetch_user(cursor: pymysql.cursors.Cursor, user_id: int, user_type: str) ->
         "created_at": row[5] if isinstance(row[5], str) else row[5].strftime("%Y-%m-%d %H:%M:%S"),
         "updated_at": row[6] if isinstance(row[6], str) else row[6].strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+@router.get(
+    "/me",
+    summary="获取当前登录用户信息",
+    description="根据当前登录用户信息返回用户表中的全部字段（不包含密码）",
+)
+def get_current_user_info(
+    current_user: dict = Depends(get_current_user),
+    db: pymysql.connections.Connection = Depends(get_db),
+):
+    cursor = None
+    try:
+        user_id = current_user.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="请先登录")
+        user_type = _resolve_user_type_from_payload(current_user)
+        info = USER_TABLES[user_type]
+        table = info["table"]
+        cursor = db.cursor(pymysql.cursors.DictCursor)
+        cursor.execute(f"SELECT * FROM {table} WHERE id = %s", (user_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        row.pop("password", None)
+        return {"user_type": user_type, **row}
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        logger.error(f"获取用户信息数据库错误: {str(e)}")
+        raise HTTPException(status_code=500, detail="获取用户信息失败")
+    finally:
+        if cursor:
+            cursor.close()
+
+
+@router.post(
+    "/login",
+    response_model=LoginResponse,
+    summary="用户登录",
+    description="统一账号密码登录，返回 JWT access token 和用户信息",
+)
+def login_user(payload: LoginRequest, db: pymysql.connections.Connection = Depends(get_db)):
+    cursor = None
+    try:
+        cursor = db.cursor(pymysql.cursors.DictCursor)
+        username = payload.username.strip()
+        if not username:
+            raise HTTPException(status_code=400, detail="username 不能为空")
+        if not payload.password:
+            raise HTTPException(status_code=400, detail="password 不能为空")
+
+        candidates: list[tuple[str, dict]] = []
+
+        if payload.user_type:
+            row = _fetch_user_for_login(cursor, username, payload.user_type)
+            if row:
+                candidates.append((payload.user_type, row))
+        else:
+            for user_type in ("admin", "teacher", "student"):
+                row = _fetch_user_for_login(cursor, username, user_type)
+                if row:
+                    candidates.append((user_type, row))
+
+        if not candidates:
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+        matched: list[tuple[str, dict]] = []
+        for user_type, row in candidates:
+            password_hash = row.get("password")
+            if password_hash and verify_password(payload.password, password_hash):
+                matched.append((user_type, row))
+
+        if not matched:
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+        if len(matched) > 1:
+            raise HTTPException(status_code=400, detail="账号在多个用户类型中匹配，请指定 user_type")
+
+        user_type, row = matched[0]
+        role = row.get("role") or user_type
+        token_payload = {
+            "sub": row["id"],
+            "username": row["username"],
+            "roles": [role],
+            "user_type": user_type,
+        }
+        access_token = create_access_token(token_payload)
+
+        row.pop("password", None)
+        user_out = UserOut(**row)
+        return LoginResponse(access_token=access_token, user=user_out)
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        logger.error(f"用户登录数据库错误: {str(e)}")
+        raise HTTPException(status_code=500, detail="登录失败")
+    finally:
+        if cursor:
+            cursor.close()
 
 
 @router.post(

@@ -165,8 +165,11 @@ CREATE TABLE IF NOT EXISTS `group_members` (
     `detail` TEXT COMMENT '状态描述/详情',
     `operated_by` VARCHAR(64) DEFAULT NULL COMMENT '操作人',
     `operated_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '操作时间',
+    `is_active` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否有效（用于软删除）',
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
     PRIMARY KEY (`group_id`, `member_id`, `member_type`),
     KEY `idx_member_id` (`member_id`),
+    KEY `idx_member_type` (`member_type`),
     KEY `idx_group_id` (`group_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='群组成员关系表';
 """
@@ -459,6 +462,10 @@ TABLE_COLUMN_DEFINITIONS = {
         "member_type": "`member_type` ENUM('student', 'teacher', 'admin') NOT NULL COMMENT '成员类型'",
         "role": "`role` ENUM('member', 'admin', 'owner') NOT NULL DEFAULT 'member' COMMENT '角色：member普通成员, admin管理员, owner群主'",
         "joined_at": "`joined_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '加入时间'",
+        "status": "`status` VARCHAR(32) NOT NULL DEFAULT 'active' COMMENT '状态（如uploaded, processing, completed等）'",
+        "detail": "`detail` TEXT COMMENT '状态描述/详情'",
+        "operated_by": "`operated_by` VARCHAR(64) DEFAULT NULL COMMENT '操作人'",
+        "operated_time": "`operated_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '操作时间'",
         "is_active": "`is_active` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否有效（用于软删除）'",
         "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间'",
         "updated_at": "`updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间'",
@@ -686,6 +693,11 @@ def sync_schema(database_url: str | None = None) -> None:
                     stmt = f"ALTER TABLE `{table}` ADD COLUMN {col_def};"
                     with conn.cursor() as cur:
                         cur.execute(stmt)
+
+        # Align group_members column definitions (including defaults/comments)
+        for col_def in TABLE_COLUMN_DEFINITIONS.get("group_members", {}).values():
+            with conn.cursor() as cur:
+                cur.execute(f"ALTER TABLE `group_members` MODIFY COLUMN {col_def};")
 
         # Ensure enum definition for group_members.role includes owner
         with conn.cursor() as cur:
