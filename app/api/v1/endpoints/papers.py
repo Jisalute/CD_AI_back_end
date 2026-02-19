@@ -135,9 +135,9 @@ async def upload_paper(
         INSERT INTO papers_history (
             paper_id, version, size, status, oss_key,
             submitted_by_id, submitted_by_name, submitted_by_role,
-            operated_by, operated_time, created_at
+            operated_by, operated_time, created_at, updated_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         cursor.execute(
             history_sql,
@@ -151,6 +151,7 @@ async def upload_paper(
                 submitter_name,
                 submitter_role,
                 submitter_name or str(submitter_id), 
+                now,
                 now,
                 now
             )
@@ -246,9 +247,9 @@ async def update_paper(
         INSERT INTO papers_history (
             paper_id, version, size, status, oss_key,
             submitted_by_id, submitted_by_name, submitted_by_role,
-            operated_by, operated_time, created_at
+            operated_by, operated_time, created_at, updated_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         cursor.execute(
             history_sql,
@@ -262,6 +263,7 @@ async def update_paper(
                 submitter_name,
                 submitter_role,
                 submitter_name or str(submitter_id),
+                now,
                 now,
                 now
             )
@@ -397,9 +399,9 @@ def create_paper_status(
         INSERT INTO papers_history (
             paper_id, version, size, status, oss_key,
             submitted_by_id, submitted_by_name, submitted_by_role,
-            operated_by, operated_time, created_at
+            operated_by, operated_time, created_at, updated_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         cursor.execute("SELECT submitted_by_name, submitted_by_role FROM papers WHERE id = %s", (paper_id,))
         origin_submit = cursor.fetchone()
@@ -416,6 +418,7 @@ def create_paper_status(
                 submitter_name,
                 submitter_role,
                 current_user.get("username") or str(login_user_id),  # 本次操作人
+                now_str,
                 now_str,
                 now_str
             )
@@ -551,9 +554,9 @@ def update_paper_status(
         INSERT INTO papers_history (
             paper_id, version, size, status, oss_key,
             submitted_by_id, submitted_by_name, submitted_by_role,
-            operated_by, operated_time, created_at
+            operated_by, operated_time, created_at, updated_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         cursor.execute("SELECT submitted_by_name, submitted_by_role FROM papers WHERE id = %s", (paper_id,))
         origin_submit = cursor.fetchone()
@@ -570,6 +573,7 @@ def update_paper_status(
                 submitter_name,
                 submitter_role,
                 current_user.get("username") or str(login_user_id),  # 本次状态更新操作人
+                now_str,
                 now_str,
                 now_str
             )

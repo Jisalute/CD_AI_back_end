@@ -218,6 +218,7 @@ CREATE TABLE IF NOT EXISTS `papers_history` (
     `operated_by` VARCHAR(64) DEFAULT NULL COMMENT '操作人',
     `operated_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '操作时间',
     `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
     PRIMARY KEY (`id`),
     KEY `idx_papers_history_paper_id` (`paper_id`),
     KEY `idx_papers_history_version` (`version`),
@@ -485,8 +486,8 @@ TABLE_COLUMN_DEFINITIONS = {
         "submitted_by_role": "`submitted_by_role` VARCHAR(64) DEFAULT NULL COMMENT '提交者角色'",
         "operated_by": "`operated_by` VARCHAR(64) DEFAULT NULL COMMENT '操作人'",
         "operated_time": "`operated_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '操作时间'",
-        "created_at": "`created_at` DATETIME NOT NULL COMMENT '创建时间'",
-        "updated_at": "`updated_at` DATETIME NOT NULL COMMENT '更新时间'",
+        "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间'",
+        "updated_at": "`updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'",
     },
     "papers_history": {
         "id": "`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY",
@@ -502,7 +503,7 @@ TABLE_COLUMN_DEFINITIONS = {
         "operated_by": "`operated_by` VARCHAR(64) DEFAULT NULL COMMENT '操作人'",
         "operated_time": "`operated_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '操作时间'",
         "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间'",
-        "updated_at": "`updated_at` DATETIME NOT NULL COMMENT '更新时间'",
+        "updated_at": "`updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'",
     },
     "paper_reviews": {
         "id": "`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '审阅记录ID'",
@@ -698,6 +699,14 @@ def sync_schema(database_url: str | None = None) -> None:
         for col_def in TABLE_COLUMN_DEFINITIONS.get("group_members", {}).values():
             with conn.cursor() as cur:
                 cur.execute(f"ALTER TABLE `group_members` MODIFY COLUMN {col_def};")
+
+        # Align papers and papers_history timestamp defaults
+        for table in ("papers", "papers_history"):
+            for col_name in ("created_at", "updated_at"):
+                col_def = TABLE_COLUMN_DEFINITIONS.get(table, {}).get(col_name)
+                if col_def:
+                    with conn.cursor() as cur:
+                        cur.execute(f"ALTER TABLE `{table}` MODIFY COLUMN {col_def};")
 
         # Ensure enum definition for group_members.role includes owner
         with conn.cursor() as cur:
