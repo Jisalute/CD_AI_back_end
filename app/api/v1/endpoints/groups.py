@@ -39,9 +39,11 @@ class GroupCreate(BaseModel):
 class GroupMember(BaseModel):
     """群组成员增删请求体"""
 
-    member_id: int
-    member_type: str  # 学生 student / 教师 teacher / 管理员 admin
+    member_id: int | None = None
+    member_type: str = "student"  # 学生 student / 教师 teacher / 管理员 admin
     role: str = "member"  # 成员 member / 管理员 admin / 群主 owner
+    action: str = "add"  # add: 添加成员, list_students: 获取教师负责的学生列表
+    student_ids: list[int] | None = None  # 批量添加时的学生ID列表
     current_user: CurrentUser
 
 
@@ -739,26 +741,61 @@ async def update_group(group_id: str, payload: GroupUpdate):
 
 @router.post(
     "/{group_id}/members",
-    summary="添加群组成员",
-    description="为指定群组添加成员（学生/教师/管理员）"
+    summary="添加群组成员或获取教师负责的学生列表",
+    description="为指定群组添加成员（单个或批量），或获取教师负责的学生列表"
 )
-async def add_group_member(group_id: str, payload: GroupMember):
-    logger.info(f"添加成员请求: group_id={group_id}, payload={payload.model_dump()}")
-    cu = _parse_current_user(payload.current_user.model_dump())
-    # only group owner or group admin can add members
-    if payload.member_type not in ["student", "teacher", "admin"]:
-        logger.warning(f"无效member_type: {payload.member_type}")
-        raise HTTPException(status_code=400, detail="成员类型必须是student、teacher或admin")
-    if payload.role not in ["member", "admin", "owner"]:
-        logger.warning(f"无效role: {payload.role}")
-        raise HTTPException(status_code=400, detail="角色必须是member、admin或owner")
-
+async def add_group_member(
+    group_id: str,
+    action: str = Query("add", description="操作类型: add(添加成员) 或 list_students(获取学生列表)", enum=["add", "list_students"]),
+    member_id: int | None = Query(None, description="单个成员ID"),
+    member_type: str = Query("student", description="成员类型: student, teacher, admin", enum=["student", "teacher", "admin"]),
+    role: str = Query("member", description="角色: member, admin, owner", enum=["member", "admin", "owner"]),
+    student_ids: str | None = Query(None, description="批量添加学生ID列表，逗号分隔，例如: 1,2,3"),
+    current_user: str = Query(None, description="当前用户信息(JSON字符串)，示例: {\"sub\":1,\"roles\":[\"teacher\"],\"username\":\"teacher1\"}")
+):
+    logger.info(f"请求: group_id={group_id}, action={action}")
+    cu = _parse_current_user(current_user)
+    roles_norm = _normalize_roles(cu.get("roles", []))
+    
     conn = get_connection()
     try:
-        cursor = conn.cursor()
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
         # ensure caller identity exists
         _ensure_caller_identity(cursor, cu)
-
+        
+        if action == "list_students":
+            # 获取教师负责的学生列表
+            if "teacher" not in roles_norm and "教师" not in roles_norm:
+                raise HTTPException(status_code=403, detail="仅教师可获取学生列表")
+            
+            teacher_id = cu.get("sub", 0)
+            # 通过 papers 表查询与该教师关联的学生
+            cursor.execute(
+                """
+                SELECT DISTINCT s.id, s.student_id, s.name, s.phone, s.email, s.grade, s.class_name
+                FROM students s
+                INNER JOIN papers p ON s.id = p.owner_id
+                WHERE p.teacher_id = %s
+                ORDER BY s.name
+                """,
+                (teacher_id,)
+            )
+            students = cursor.fetchall()
+            return {
+                "action": "list_students",
+                "teacher_id": teacher_id,
+                "students": students,
+                "total": len(students)
+            }
+        
+        # 以下是 add 操作
+        if member_type not in ["student", "teacher", "admin"]:
+            logger.warning(f"无效member_type: {member_type}")
+            raise HTTPException(status_code=400, detail="成员类型必须是student、teacher或admin")
+        if role not in ["member", "admin", "owner"]:
+            logger.warning(f"无效role: {role}")
+            raise HTTPException(status_code=400, detail="角色必须是member、admin或owner")
+        
         cursor.execute("SELECT 1 FROM `groups` WHERE `group_id` = %s", (group_id,))
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="群组不存在")
@@ -769,35 +806,81 @@ async def add_group_member(group_id: str, payload: GroupMember):
         )
         if not cursor.fetchone():
             raise HTTPException(status_code=403, detail="只有群主或群组管理员可添加成员")
-        # 检查成员是否存在
-        table_map = {"student": "`students`", "teacher": "`teachers`", "admin": "`admins`"}
-        table = table_map[payload.member_type]
-        cursor.execute(f"SELECT 1 FROM {table} WHERE `id` = %s", (payload.member_id,))
-        if not cursor.fetchone():
-            raise HTTPException(status_code=404, detail=f"{payload.member_type} ID {payload.member_id} 不存在")
+        
         # if trying to add owner, only current owner can do that
-        if payload.role == 'owner':
+        if role == 'owner':
             cursor.execute("SELECT 1 FROM `group_members` WHERE `group_id`=%s AND `member_id`=%s AND `role`='owner' AND `is_active`=1", (group_id, cu.get('sub', 0)))
             if not cursor.fetchone():
                 raise HTTPException(status_code=403, detail="只有当前群主可任命新群主")
-
-        # insert as active member
-        cursor.execute(
-            """
-            INSERT INTO `group_members` (`group_id`, `member_id`, `member_type`, `role`, `is_active`, `joined_at`)
-            VALUES (%s, %s, %s, %s, 1, NOW())
-            ON DUPLICATE KEY UPDATE `is_active` = 1, `role` = VALUES(`role`), `updated_at`=NOW()
-            """,
-            (group_id, payload.member_id, payload.member_type, payload.role),
-        )
-        conn.commit()
-        return {
-            "group_id": group_id,
-            "member_id": payload.member_id,
-            "member_type": payload.member_type,
-            "role": payload.role,
-            "message": "成员已添加/更新",
-        }
+        
+        # 批量添加或单个添加
+        if student_ids:
+            # 批量添加学生
+            try:
+                student_id_list = [int(s.strip()) for s in student_ids.split(",") if s.strip()]
+            except ValueError:
+                raise HTTPException(status_code=400, detail="student_ids 格式错误，请使用逗号分隔的数字，例如: 1,2,3")
+            
+            added_members = []
+            for sid in student_id_list:
+                # 检查学生是否存在
+                cursor.execute("SELECT 1 FROM `students` WHERE `id` = %s", (sid,))
+                if not cursor.fetchone():
+                    logger.warning(f"学生ID {sid} 不存在，跳过")
+                    continue
+                
+                # 插入成员
+                cursor.execute(
+                    """
+                    INSERT INTO `group_members` (`group_id`, `member_id`, `member_type`, `role`, `is_active`, `joined_at`)
+                    VALUES (%s, %s, %s, %s, 1, NOW())
+                    ON DUPLICATE KEY UPDATE `is_active` = 1, `role` = VALUES(`role`), `updated_at`=NOW()
+                    """,
+                    (group_id, sid, "student", role),
+                )
+                added_members.append({
+                    "member_id": sid,
+                    "member_type": "student",
+                    "role": role
+                })
+            
+            conn.commit()
+            return {
+                "group_id": group_id,
+                "action": "batch_add",
+                "added_members": added_members,
+                "total_added": len(added_members),
+                "message": f"成功添加 {len(added_members)} 名成员"
+            }
+        else:
+            # 单个添加成员
+            if member_id is None:
+                raise HTTPException(status_code=400, detail="必须提供 member_id 或 student_ids")
+            
+            # 检查成员是否存在
+            table_map = {"student": "`students`", "teacher": "`teachers`", "admin": "`admins`"}
+            table = table_map[member_type]
+            cursor.execute(f"SELECT 1 FROM {table} WHERE `id` = %s", (member_id,))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail=f"{member_type} ID {member_id} 不存在")
+            
+            # insert as active member
+            cursor.execute(
+                """
+                INSERT INTO `group_members` (`group_id`, `member_id`, `member_type`, `role`, `is_active`, `joined_at`)
+                VALUES (%s, %s, %s, %s, 1, NOW())
+                ON DUPLICATE KEY UPDATE `is_active` = 1, `role` = VALUES(`role`), `updated_at`=NOW()
+                """,
+                (group_id, member_id, member_type, role),
+            )
+            conn.commit()
+            return {
+                "group_id": group_id,
+                "member_id": member_id,
+                "member_type": member_type,
+                "role": role,
+                "message": "成员已添加/更新",
+            }
     except HTTPException:
         raise
     except pymysql.MySQLError as e:
