@@ -18,7 +18,9 @@ from fastapi.openapi.docs import (
 
 from app.api.v1.routes import api_router
 from app.config import settings
+
 from app.middleware import setup_middleware
+from app.static_config import setup_static_files
 
 
 openapi_tags = [
@@ -61,7 +63,9 @@ def register_routes(app: FastAPI) -> None:
 	app.include_router(api_router, prefix="/api/v1")
 
 
+
 setup_middlewares(app)
+setup_static_files(app)
 register_routes(app)
 
 
