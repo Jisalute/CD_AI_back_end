@@ -144,7 +144,7 @@ async def upload_paper(
             owner_id, teacher_id, latest_version, version, size, status, oss_key, pdf_oss_key,
             submitted_by_name, submitted_by_role, created_at, updated_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         cursor.execute(
             paper_sql,
