@@ -22,6 +22,12 @@ from app.database import get_db
 import pymysql
 import json
 
+try:
+    from docx2pdf import convert
+    import tempfile
+except ImportError:
+    raise ImportError("请安装依赖：pip install docx2pdf pywin32 (Windows) 或 libreoffice (Linux/Mac)")
+
 router = APIRouter()
 
 
@@ -62,6 +68,28 @@ def _parse_version(version_str: str) -> tuple:
             detail="版本号格式错误，必须符合 v+数字.数字 格式（如 v1.0、v2.1）"
         )
 
+def convert_docx_to_pdf(docx_content: bytes, filename: str) -> tuple:
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as temp_docx:
+            temp_docx.write(docx_content)
+            temp_docx_path = temp_docx.name
+        pdf_filename = os.path.splitext(filename)[0] + '.pdf'
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_pdf:
+            temp_pdf_path = temp_pdf.name
+        convert(temp_docx_path, temp_pdf_path)
+        with open(temp_pdf_path, 'rb') as f:
+            pdf_content = f.read()
+        os.unlink(temp_docx_path)
+        os.unlink(temp_pdf_path)
+        
+        return pdf_content, pdf_filename
+    
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"DOCX转PDF失败：{str(e)}。请确保已安装docx2pdf依赖和对应的转换引擎（Windows: Microsoft Word, Linux/Mac: LibreOffice）"
+        )
+
 
 @router.post(
     "/upload",
@@ -97,6 +125,10 @@ async def upload_paper(
 
     # 本地存储论文到 doc/essay（返回路径作为 oss_key）
     oss_key = upload_paper_to_storage(file.filename, contents)
+    
+    # 转换docx到pdf并上传到OSS
+    pdf_content, pdf_filename = convert_docx_to_pdf(contents, file.filename)
+    pdf_oss_key = upload_paper_to_storage(pdf_filename, pdf_content)
 
     # 持久化到数据库：创建paper记录和初始版本v1.0
     cursor = None 
@@ -109,10 +141,10 @@ async def upload_paper(
         version = "v1.0"
         paper_sql = """
         INSERT INTO papers (
-            owner_id, teacher_id, latest_version, version, size, status, oss_key,
+            owner_id, teacher_id, latest_version, version, size, status, oss_key, pdf_oss_key,
             submitted_by_name, submitted_by_role, created_at, updated_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         cursor.execute(
             paper_sql,
@@ -124,6 +156,7 @@ async def upload_paper(
                 size,
                 "已上传",
                 oss_key,
+                pdf_oss_key,
                 submitter_name,
                 submitter_role,
                 now,
@@ -133,11 +166,11 @@ async def upload_paper(
         paper_id = cursor.lastrowid
         history_sql = """
         INSERT INTO papers_history (
-            paper_id, version, size, status, oss_key,
+            paper_id, version, size, status, oss_key, pdf_oss_key,
             submitted_by_id, submitted_by_name, submitted_by_role,
             operated_by, operated_time, created_at, updated_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         cursor.execute(
             history_sql,
@@ -147,6 +180,7 @@ async def upload_paper(
                 size,
                 "已上传",
                 oss_key,
+                pdf_oss_key, 
                 str(submitter_id),  
                 submitter_name,
                 submitter_role,
@@ -208,7 +242,14 @@ async def update_paper(
                 status_code=400,
                 detail=f"新版本号必须大于当前最新版本号 {current_version_str}，当前提交的版本号 {version} 不符合要求"
             )
+        
+        # 上传docx文件
         oss_key = upload_paper_to_storage(file.filename, contents)
+        
+        # 转换docx到pdf并上传到OSS
+        pdf_content, pdf_filename = convert_docx_to_pdf(contents, file.filename)
+        pdf_oss_key = upload_paper_to_storage(pdf_filename, pdf_content)
+
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         submitter_name = current_user.get("username") or ""
         roles = current_user.get("roles") or []
@@ -224,6 +265,7 @@ async def update_paper(
                 submitted_by_name = %s,
                 submitted_by_role = %s,
                 oss_key = %s,
+                pdf_oss_key = %s, 
                 updated_at = %s,
                 operated_by = %s,
                 operated_time = %s
@@ -237,6 +279,7 @@ async def update_paper(
                 submitter_name,
                 submitter_role,
                 oss_key,
+                pdf_oss_key,
                 now,
                 submitter_name,
                 now,
@@ -245,11 +288,11 @@ async def update_paper(
         )
         history_sql = """
         INSERT INTO papers_history (
-            paper_id, version, size, status, oss_key,
+            paper_id, version, size, status, oss_key, pdf_oss_key,
             submitted_by_id, submitted_by_name, submitted_by_role,
             operated_by, operated_time, created_at, updated_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         cursor.execute(
             history_sql,
@@ -259,6 +302,7 @@ async def update_paper(
                 size,
                 "已更新",
                 oss_key,
+                pdf_oss_key, 
                 str(submitter_id),
                 submitter_name,
                 submitter_role,
@@ -354,11 +398,11 @@ def create_paper_status(
     cursor = None
     try:
         cursor = db.cursor()
-        cursor.execute("SELECT owner_id, teacher_id, latest_version, oss_key, size FROM papers WHERE id = %s", (paper_id,))
+        cursor.execute("SELECT owner_id, teacher_id, latest_version, oss_key, pdf_oss_key, size FROM papers WHERE id = %s", (paper_id,))
         paper_info = cursor.fetchone()
         if not paper_info:
             raise HTTPException(status_code=404, detail="论文不存在")
-        student_id, teacher_id, version, oss_key, current_size = paper_info 
+        student_id, teacher_id, version, oss_key, pdf_oss_key, current_size = paper_info 
         cursor.execute(
             "SELECT status, size FROM papers WHERE id = %s",
             (paper_id,),
@@ -397,7 +441,7 @@ def create_paper_status(
         )
         history_sql = """
         INSERT INTO papers_history (
-            paper_id, version, size, status, oss_key,
+            paper_id, version, size, status, oss_key, pdf_oss_key,
             submitted_by_id, submitted_by_name, submitted_by_role,
             operated_by, operated_time, created_at, updated_at
         )
@@ -414,6 +458,7 @@ def create_paper_status(
                 size,
                 status,
                 oss_key,
+                pdf_oss_key, 
                 str(student_id), 
                 submitter_name,
                 submitter_role,
@@ -467,13 +512,13 @@ def update_paper_status(
     try:
         cursor = db.cursor()
         cursor.execute(
-            "SELECT owner_id, teacher_id, latest_version, oss_key, size FROM papers WHERE id = %s", 
+            "SELECT owner_id, teacher_id, latest_version, oss_key, pdf_oss_key, size FROM papers WHERE id = %s", 
             (paper_id,)
         )
         paper_info = cursor.fetchone()
         if not paper_info:
             raise HTTPException(status_code=404, detail="论文不存在")
-        student_id, teacher_id, version, oss_key, original_size = paper_info 
+        student_id, teacher_id, version, oss_key, pdf_oss_key, original_size = paper_info 
         cursor.execute(
             """
             SELECT size, status FROM papers
@@ -552,7 +597,7 @@ def update_paper_status(
         )
         history_sql = """
         INSERT INTO papers_history (
-            paper_id, version, size, status, oss_key,
+            paper_id, version, size, status, oss_key, pdf_oss_key,
             submitted_by_id, submitted_by_name, submitted_by_role,
             operated_by, operated_time, created_at, updated_at
         )
@@ -569,6 +614,7 @@ def update_paper_status(
                 original_size,
                 status,
                 oss_key,
+                pdf_oss_key,
                 str(student_id),
                 submitter_name,
                 submitter_role,
