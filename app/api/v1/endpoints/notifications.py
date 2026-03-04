@@ -25,14 +25,15 @@ def push_notification(
     payload: NotificationContent,
     target_user_id: str | None = Query(None, description="单个目标用户ID"),
     target_user_ids: str | None = Query(None, description="批量目标用户ID列表，逗号分隔，例如: 1,2,3"),
-    current_user: str = Query(..., description="当前用户信息(JSON字符串)，示例: {\"sub\":1,\"roles\":[\"teacher\"],\"username\":\"teacher1\"}"),
+    teacher_id: str | None = Query(None, description="教师ID，管理员可通过教师ID给教师推送信息"),
+    current_user: str = Query(..., description="当前用户信息(JSON字符串)，示例: {\"sub\":1,\"roles\":[\"admin\"],\"username\":\"admin1\"}"),
     db: pymysql.connections.Connection = Depends(get_db),
 ):
     cursor = None
     try:
         # 1. 核心参数校验
-        if not (target_user_id or target_user_ids):
-            raise HTTPException(status_code=400, detail="必须提供目标用户ID（target_user_id）或目标用户ID列表（target_user_ids）")
+        if not (target_user_id or target_user_ids or teacher_id):
+            raise HTTPException(status_code=400, detail="必须提供目标用户ID（target_user_id）、目标用户ID列表（target_user_ids）或教师ID（teacher_id）")
         if not payload.title:
             raise HTTPException(status_code=400, detail="消息标题（title）不能为空")
         if not payload.content:
@@ -50,11 +51,15 @@ def push_notification(
             sender_id = "unknown"
             sender_role = "user"
         
+        # 3. 权限验证：如果提供了 teacher_id，只有管理员可以使用
+        if teacher_id and "admin" not in sender_roles:
+            raise HTTPException(status_code=403, detail="只有管理员可以通过教师ID给教师推送信息")
+        
         cursor = db.cursor()
         now = datetime.now()
         now_str = now.strftime("%Y-%m-%d %H:%M:%S")
         
-        # 3. 准备目标用户列表
+        # 4. 准备目标用户列表
         target_users = []
         if target_user_id:
             target_users.append({"user_id": target_user_id, "username": ""})
@@ -62,8 +67,11 @@ def push_notification(
             user_id_list = [uid.strip() for uid in target_user_ids.split(",") if uid.strip()]
             for user_id in user_id_list:
                 target_users.append({"user_id": user_id, "username": ""})
+        if teacher_id:
+            # 管理员通过教师ID给教师推送信息
+            target_users.append({"user_id": teacher_id, "username": ""})
         
-        # 4. 处理消息内容
+        # 5. 处理消息内容
         content_value = payload.content or ""
         metadata = {}
         # 如果 content 超过 TEXT 大小（防护），将超长部分保存到 metadata.long_content
@@ -71,14 +79,14 @@ def push_notification(
             metadata["long_content"] = content_value[60000:]
             content_value = content_value[:60000]
 
-        # 5. 保存 sender 信息到 metadata
+        # 6. 保存 sender 信息到 metadata
         metadata["sender_id"] = sender_id
         metadata["sender_role"] = sender_role
 
         metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
         source_value = "system"  # 固定来源
         
-        # 4. 组装插入SQL
+        # 7. 组装插入SQL
         insert_sql = """
         INSERT INTO user_messages (
             user_id, username, title, content, source, status, 
@@ -86,7 +94,7 @@ def push_notification(
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         
-        # 5. 批量执行插入操作
+        # 8. 批量执行插入操作
         inserted_ids = []
         for user in target_users:
             cursor.execute(
@@ -108,7 +116,7 @@ def push_notification(
         
         db.commit()
         
-        # 6. 返回推送结果
+        # 9. 返回推送结果
         return {
             "message": f"消息推送成功，共推送 {len(target_users)} 条消息",
             "message_ids": inserted_ids,
