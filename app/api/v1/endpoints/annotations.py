@@ -9,8 +9,22 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 import urllib.parse
 import re 
+from pydantic import BaseModel
 
 router = APIRouter()
+
+class AnnotationOut(BaseModel):
+    id: int
+    paper_id: int
+    author_id: int
+    paragraph_id: Optional[str] = None
+    coordinates: Optional[Dict[str, float]] = None
+    content: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    class Config:
+        orm_mode = True
 
 def _parse_current_user(current_user: Optional[str]) -> dict:
     try:
@@ -132,19 +146,30 @@ def create_annotation(
         db.commit()
         
         annotation_id = cursor.lastrowid
+        cursor.execute(
+            """
+            SELECT id, paper_id, author_id, paragraph_id, coordinates, content, created_at, updated_at
+            FROM annotations WHERE id = %s
+            """,
+            (annotation_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=500, detail="创建标注后查询全量信息失败")
+
         logger.info(
             f"教师用户{login_user_id}为论文{paper_id}创建标注成功，标注ID: {annotation_id}"
         )
-        
+
         return AnnotationOut(
-            id=annotation_id,
-            paper_id=paper_id,
-            author_id=login_user_id,
-            paragraph_id=paragraph_id,
-            coordinates=_parse_coordinates(coord_json), 
-            content=content.strip(),
-            created_at=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            updated_at=now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            id=row[0],
+            paper_id=row[1],
+            author_id=row[2],
+            paragraph_id=row[3],
+            coordinates=_parse_coordinates(row[4]),
+            content=row[5],
+            created_at=row[6].strftime("%Y-%m-%dT%H:%M:%SZ"),
+            updated_at=row[7].strftime("%Y-%m-%dT%H:%M:%SZ")
         )
     except pymysql.MySQLError as e:
         db.rollback()
@@ -270,6 +295,7 @@ def update_annotation(
                 author_id=row[2],
                 paragraph_id=row[3],
                 coordinates=_parse_coordinates(row[4]), 
+                content=row[5],
                 created_at=row[6].strftime("%Y-%m-%dT%H:%M:%SZ"),
                 updated_at=row[7].strftime("%Y-%m-%dT%H:%M:%SZ")
             )
@@ -293,7 +319,7 @@ def update_annotation(
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="标注更新后查询失败")
-        
+
         logger.info(
             f"教师用户{login_user_id}更新标注成功，标注ID: {annotation_id}"
         )
@@ -426,13 +452,14 @@ def delete_annotation(
             )
         cursor.execute(
             """
-            SELECT 1 FROM annotations 
+            SELECT id, paper_id, author_id, paragraph_id, coordinates, content, created_at, updated_at
+            FROM annotations 
             WHERE id = %s AND paper_id = %s
             """,
             (annotation_id, paper_id)
         )
-        annotation_exists = cursor.fetchone()
-        if not annotation_exists:
+        del_row = cursor.fetchone()
+        if not del_row:
             raise HTTPException(
                 status_code=404,
                 detail=f"标注不存在：标注ID({annotation_id}) 不属于论文ID({paper_id})"
@@ -443,20 +470,26 @@ def delete_annotation(
         """
         cursor.execute(delete_sql, (annotation_id, paper_id))
         db.commit()
-        
+
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="标注删除失败：标注不存在")
-        
+
         logger.info(
             f"教师用户{login_user_id}删除标注成功，标注ID: {annotation_id}，论文ID: {paper_id}"
         )
-        
+
         return {
             "code": 200,
             "message": f"标注ID({annotation_id}) 删除成功",
             "data": {
-                "annotation_id": annotation_id,
-                "paper_id": paper_id
+                "annotation_id": del_row[0],
+                "paper_id": del_row[1],
+                "author_id": del_row[2],
+                "paragraph_id": del_row[3],
+                "coordinates": _parse_coordinates(del_row[4]),
+                "content": del_row[5],
+                "created_at": del_row[6].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "updated_at": del_row[7].strftime("%Y-%m-%dT%H:%M:%SZ")
             }
         }
     except pymysql.MySQLError as e:
