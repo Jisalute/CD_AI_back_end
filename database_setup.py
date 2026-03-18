@@ -335,12 +335,14 @@ CREATE TABLE IF NOT EXISTS `ddl_management` (
     ddlid INT PRIMARY KEY AUTO_INCREMENT COMMENT 'DDL唯一ID',
     teacher_id INT NOT NULL COMMENT '教师ID）',
     teacher_name VARCHAR(50) NOT NULL COMMENT '教师姓名', 
+    group_id INT NOT NULL COMMENT '群组ID',
     ddl_time DATETIME NOT NULL COMMENT '截止时间（精确到秒）',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     INDEX idx_teacher_id (teacher_id),
     INDEX idx_ddl_time (ddl_time),
-    INDEX idx_teacher_name (teacher_name) 
+    INDEX idx_teacher_name (teacher_name),
+    INDEX idx_group_id (group_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='论文DDL截止时间管理表';
 """
 
@@ -629,6 +631,7 @@ TABLE_COLUMN_DEFINITIONS = {
         "ddlid": "`ddlid` INT AUTO_INCREMENT COMMENT 'DDL唯一ID'",
         "teacher_id": "`teacher_id` INT NOT NULL COMMENT '教师ID）'",
         "teacher_name": "`teacher_name` VARCHAR(50) NOT NULL COMMENT '教师姓名'",
+        "group_id": "`group_id` INT NOT NULL COMMENT '群组ID'",
         "ddl_time": "`ddl_time` DATETIME NOT NULL COMMENT '截止时间（精确到秒）'",
         "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间'",
         "updated_at": "`updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间'",
@@ -767,7 +770,8 @@ TABLE_INDEX_DEFINITIONS = {
     "ddl_management": [
         "CREATE INDEX idx_teacher_id ON `ddl_management` (teacher_id)",
         "CREATE INDEX idx_ddl_time ON `ddl_management` (ddl_time)",
-        "CREATE INDEX idx_teacher_name ON `ddl_management` (teacher_name)"
+        "CREATE INDEX idx_teacher_name ON `ddl_management` (teacher_name)",
+        "CREATE INDEX idx_group_id ON `ddl_management` (group_id)"
     ],
     "templates": [
         "CREATE UNIQUE INDEX uniq_template_id ON `templates` (template_id)",
