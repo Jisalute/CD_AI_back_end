@@ -1368,6 +1368,7 @@ async def get_group_papers(
             p.id as paper_id,
             p.updated_at as paper_update_time,
             p.oss_key as paper_oss_key,
+            p.pdf_oss_key as paper_pdf_oss_key,
             (SELECT COUNT(*) FROM annotations WHERE paper_id = p.id) as annotation_count
         FROM
             students s
@@ -1406,7 +1407,8 @@ async def get_group_papers(
                 "student_number": paper_info.get('student_number'),
                 "paper_update_time": paper_info.get('paper_update_time').strftime("%Y-%m-%d %H:%M:%S") if paper_info.get('paper_update_time') else None,
                 "annotation_count": paper_info.get('annotation_count', 0),
-                "oss_key": paper_info.get('paper_oss_key')
+                "oss_key": paper_info.get('paper_oss_key'),
+                "pdf_oss_key": paper_info.get('paper_pdf_oss_key')
             })
         
         return {

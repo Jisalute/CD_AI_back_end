@@ -625,7 +625,7 @@ def update_paper_status(
         if current_status == "已定稿":
             raise HTTPException(
                 status_code=403,
-                detail=f"论文最近有效状态为【已定稿】，不允许修改任何状态"
+                detail="论文最近有效状态为【已定稿】，不允许修改任何状态"
             )
         if status not in allowed_target_status:
             role_name = "学生" if is_student else "老师"
@@ -1670,3 +1670,64 @@ def update_ddl(
                 cursor.close()
             except Exception:
                 pass
+
+
+@router.get(
+    "/{paper_id}",
+    response_model=Dict,
+    summary="查看论文所有信息",
+    description="输入论文ID查询指定字段信息，仅论文归属学生或关联老师可访问"
+)
+async def get_paper_detail(
+    paper_id: int,
+    db: pymysql.connections.Connection = Depends(get_db),
+    current_user: Optional[str] = Query(None, description="提交者信息(JSON字符串，包含 sub/username/roles)"),
+):
+    # 解析当前用户信息
+    current_user = _parse_current_user(current_user)
+    submitter_id = current_user.get("sub", 0)  
+
+    # 参数校验
+    if not isinstance(paper_id, int) or paper_id <= 0:
+        raise HTTPException(status_code=400, detail="paper_id必须是正整数")
+
+    # 未登录校验
+    if submitter_id <= 0:
+        raise HTTPException(status_code=401, detail="请先登录后再查看论文信息")
+
+    cursor = None
+    try:
+        cursor = db.cursor(pymysql.cursors.DictCursor)
+
+        # 仅查询指定字段（严格匹配你要求的列表）
+        paper_sql = """
+        SELECT 
+            id, owner_id, teacher_id, version, size, status, detail, 
+            DATE_FORMAT(ddl, '%Y-%m-%d %H:%i:%s') as ddl,
+            oss_key, pdf_oss_key
+        FROM papers 
+        WHERE id = %s
+        """
+        cursor.execute(paper_sql, (paper_id,))
+        paper_detail = cursor.fetchone()
+
+        # 校验论文是否存在
+        if not paper_detail:
+            raise HTTPException(status_code=404, detail=f"论文ID {paper_id} 不存在")
+
+        # 权限校验：仅论文归属学生或关联老师可访问
+        paper_owner_id = paper_detail["owner_id"]
+        paper_teacher_id = paper_detail["teacher_id"]
+        if submitter_id not in [paper_owner_id, paper_teacher_id]:
+            raise HTTPException(
+                status_code=403,
+                detail=f"无权限查看：仅论文归属者（ID={paper_owner_id}）或关联老师（ID={paper_teacher_id}）可查看该论文信息"
+            )
+
+        return paper_detail
+
+    except pymysql.MySQLError as e:
+        raise HTTPException(status_code=500, detail=f"数据库操作失败: {str(e)}")
+    finally:
+        if cursor:
+            cursor.close()
