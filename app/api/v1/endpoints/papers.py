@@ -1702,7 +1702,7 @@ async def get_paper_detail(
         paper_sql = """
         SELECT 
             id, owner_id, teacher_id, version, size, status, detail, 
-            DATE_FORMAT(ddl, '%Y-%m-%d %H:%i:%s') as ddl,
+            DATE_FORMAT(ddl, '%%Y-%%m-%%d %%H:%%i:%%s') as ddl,
             oss_key, pdf_oss_key
         FROM papers 
         WHERE id = %s
