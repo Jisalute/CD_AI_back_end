@@ -1,6 +1,6 @@
 import pymysql
+from pymysql import MySQLError
 from typing import Optional
-from datetime import datetime
 from app.models.document import DocumentRecord
 
 
@@ -20,8 +20,9 @@ class DocumentService:
             row = cur.fetchone()
         try:
             self.db.commit()
-        except Exception:
-            pass
+        except MySQLError as exc:
+            self.db.rollback()
+            raise RuntimeError("Failed to commit document creation") from exc
 
         if not row:
             raise RuntimeError("Failed to create document")

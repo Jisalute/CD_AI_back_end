@@ -16,6 +16,7 @@ from app.schemas.document import (
     DDLOut, 
 )
 from app.services.oss import get_file_from_oss, upload_paper_to_storage
+from app.services.audit import submit_audit_task
 from datetime import datetime
 from app.database import get_db
 import pymysql
@@ -166,6 +167,16 @@ async def upload_paper(
             status_code=403,
             detail="无权限上传：论文归属者ID必须与当前登录用户ID一致"
         )
+    # 检查学生是否已经上传过论文
+    cursor = None
+    try:
+        cursor = db.cursor()
+        cursor.execute("SELECT id FROM papers WHERE owner_id = %s", (owner_id,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=400, detail="每个学生只能上传一篇论文")
+    finally:
+        if cursor:
+            cursor.close()
     # 验证文件扩展名
     if not file.filename.lower().endswith(".docx"):
         raise HTTPException(status_code=400, detail="仅支持 .docx 格式")
@@ -241,6 +252,16 @@ async def upload_paper(
                 now,
                 now
             )
+        )
+
+        await submit_audit_task(
+            db,
+            file_content=contents,
+            filename=file.filename,
+            paper_id=paper_id,
+            version=version,
+            oss_key=oss_key,
+            audit_config='{"checks": ["grammar", "plagiarism"]}',
         )
         db.commit()
     except pymysql.MySQLError as e:
@@ -367,7 +388,7 @@ async def update_paper(
             )
         )
         db.commit()
-        return PaperOut(id=paper_id, owner_id=paper_owner_id, teacher_id=teacher_id, latest_version=version, oss_key=oss_key)
+        return PaperOut(id=paper_id, owner_id=paper_owner_id, teacher_id=teacher_id, latest_version=version, oss_key=oss_key, pdf_oss_key=pdf_oss_key)
     except pymysql.MySQLError as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"数据库操作失败: {str(e)}")
@@ -502,7 +523,7 @@ def create_paper_status(
             submitted_by_id, submitted_by_name, submitted_by_role,
             operated_by, operated_time, created_at, updated_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         cursor.execute("SELECT submitted_by_name, submitted_by_role FROM papers WHERE id = %s", (paper_id,))
         origin_submit = cursor.fetchone()
@@ -658,7 +679,7 @@ def update_paper_status(
             submitted_by_id, submitted_by_name, submitted_by_role,
             operated_by, operated_time, created_at, updated_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         cursor.execute("SELECT submitted_by_name, submitted_by_role FROM papers WHERE id = %s", (paper_id,))
         origin_submit = cursor.fetchone()
@@ -746,18 +767,27 @@ def submit_paper_review(
                 status_code=400,
                 detail=f"论文ID {paper_id} 已存在审阅记录（ID：{existing_review[0]}），如需修改请使用更新审阅接口"
             )
+        
+        # 获取教师姓名
+        cursor.execute("SELECT name FROM teachers WHERE id = %s", (login_user_id,))
+        teacher_row = cursor.fetchone()
+        if not teacher_row:
+            raise HTTPException(status_code=404, detail=f"教师ID {login_user_id} 不存在")
+        teacher_name = teacher_row[0]
+        
         now = datetime.now()
         review_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
         insert_sql = """
         INSERT INTO paper_reviews (
-            paper_id, teacher_id, review_content, review_time, created_at, updated_at
-        ) VALUES (%s, %s, %s, %s, %s, %s)
+            paper_id, teacher_id, teacher_name, review_content, review_time, created_at, updated_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
         cursor.execute(
             insert_sql,
             (
                 paper_id,
                 login_user_id,
+                teacher_name,
                 review_content,
                 review_time_str,
                 review_time_str,
@@ -1794,12 +1824,13 @@ async def get_paper_detail(
     cursor = None
     try:
         cursor = db.cursor(pymysql.cursors.DictCursor)
-        # 仅查询指定字段（严格匹配你要求的列表）
+        # 仅查询指定字段
         paper_sql = """
         SELECT 
             id, owner_id, teacher_id, version, size, status, detail, 
             DATE_FORMAT(ddl, '%%Y-%%m-%%d %%H:%%i:%%s') as ddl,
-            oss_key, pdf_oss_key
+            oss_key, pdf_oss_key,
+            DATE_FORMAT(updated_at, '%%Y-%%m-%%d %%H:%%i:%%s') as updated_at  -- 新增更新时间字段，格式化输出
         FROM papers 
         WHERE id = %s
         """
