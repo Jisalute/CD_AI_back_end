@@ -5,3 +5,6 @@ logs/
 doc/essay/
 doc/attachment/
 doc/template/
+uploads/
+*.db
+CLAUDE.md

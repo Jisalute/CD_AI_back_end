@@ -1,31 +1,10 @@
 from __future__ import annotations
 
-import os
-from pathlib import Path
 from typing import Dict
 from urllib.parse import parse_qs, urlparse
 
 import pymysql
-
-
-def _load_dotenv(env_path: str = ".env") -> None:
-    """Load key=value pairs from .env into environment if not already set."""
-    path = Path(env_path)
-    if not path.is_file():
-        return
-
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
-
-
-_load_dotenv()
+from app.config import settings
 
 
 def parse_mysql_url(url: str) -> Dict:
@@ -44,10 +23,7 @@ def parse_mysql_url(url: str) -> Dict:
     return dict(host=host, port=port, user=user, password=password, database=db, charset=charset)
 
 
-DEFAULT_DB_URL = os.getenv(
-    "DATABASE_URL",
-    "mysql+pymysql://root:sbtwsj1002@127.0.0.1:3306/cd_ai_db?charset=utf8mb4",
-)
+DEFAULT_DB_URL = settings.build_database_url()
 
 ACCOUNT_MAPPING_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS `account_mapping` (
@@ -99,7 +75,7 @@ CREATE TABLE IF NOT EXISTS `departments` (
 STUDENTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS `students` (
     `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键ID',
-    `student_id` VARCHAR(20) NOT NULL COMMENT '学号',
+    `student_id` VARCHAR(64) NOT NULL COMMENT '学号',
     `name` VARCHAR(128) NOT NULL COMMENT '姓名',
     `phone` VARCHAR(32) DEFAULT NULL COMMENT '联系电话',
     `email` VARCHAR(255) DEFAULT NULL COMMENT '邮箱',
@@ -108,6 +84,8 @@ CREATE TABLE IF NOT EXISTS `students` (
     `school_name` VARCHAR(128) NULL COMMENT '学校名称',
     `department_id` BIGINT UNSIGNED NULL COMMENT '所属院系ID',
     `department_name` VARCHAR(128) NULL COMMENT '院系名称',
+    `major` VARCHAR(128) NULL COMMENT '专业',
+    `class_name` VARCHAR(128) NULL COMMENT '班级',
     `group_id` BIGINT UNSIGNED NULL COMMENT '所属群组ID',
     `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
     `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
@@ -146,6 +124,25 @@ CREATE TABLE IF NOT EXISTS `teachers` (
     KEY `idx_teacher_department_id` (`department_id`),
     KEY `idx_teacher_group_id` (`group_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='教师信息表';
+"""
+
+USER_AGENT_PERMISSIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS `user_agent_permissions` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键ID',
+    `student_id` VARCHAR(64) NOT NULL COMMENT '学生学号（关联students表的student_id）',
+    `admin_id` VARCHAR(64) NOT NULL COMMENT '管理员ID（关联admins表的admin_id）',
+    `agent_permission` TINYINT NOT NULL DEFAULT 0 COMMENT '智能体使用权限，0-无权限，1-有权限',
+    `granted_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '赋予权限的时间',
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uniq_student` (`student_id`),
+    KEY `idx_admin_id` (`admin_id`),
+    KEY `idx_agent_permission` (`agent_permission`),
+    KEY `idx_granted_at` (`granted_at`),
+    CONSTRAINT `fk_user_agent_permission_student` FOREIGN KEY (`student_id`) REFERENCES `students` (`student_id`) ON DELETE CASCADE,
+    CONSTRAINT `fk_user_agent_permission_admin` FOREIGN KEY (`admin_id`) REFERENCES `admins` (`admin_id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户智能体使用权限表';
 """
 
 ADMINS_TABLE_SQL = """
@@ -243,7 +240,7 @@ PAPERS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS `papers` (
     `id` INT NOT NULL AUTO_INCREMENT COMMENT '论文ID',
     `owner_id` INT NOT NULL COMMENT '所有者ID',
-    `teacher_id` INT NOT NULL COMMENT '老师ID',
+    `teacher_id` VARCHAR(64) NOT NULL COMMENT '老师ID',
     `version` VARCHAR(20) NOT NULL COMMENT '当前版本号',
     `size` INT NOT NULL COMMENT '文件大小（字节）',
     `status` VARCHAR(32) NOT NULL COMMENT '状态（uploaded:已上传, processing:处理中, completed:完成, rejected:驳回）',
@@ -266,6 +263,76 @@ CREATE TABLE IF NOT EXISTS `papers` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='论文信息表';
 """
 
+
+PAPER_GRADES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS `paper_grades` (
+    `id` INT NOT NULL AUTO_INCREMENT COMMENT '自增ID',
+    `paper_id` INT NOT NULL COMMENT '论文ID',
+    `student_id` VARCHAR(64) DEFAULT NULL COMMENT '学生ID',
+    `paper_title` VARCHAR(255) NOT NULL COMMENT '论文题目',
+    `topic_significance_score` DECIMAL(5,2) DEFAULT NULL COMMENT '选题意义评分',
+    `logical_ability_score` DECIMAL(5,2) DEFAULT NULL COMMENT '逻辑能力评分',
+    `knowledge_application_score` DECIMAL(5,2) DEFAULT NULL COMMENT '综合应用知识能力评分',
+    `problem_analysis_solution_score` DECIMAL(5,2) DEFAULT NULL COMMENT '分析解决问题能力评分',
+    `academic_norm_score` DECIMAL(5,2) DEFAULT NULL COMMENT '学术规范评分',
+    `teacher_total_score` DECIMAL(5,2) DEFAULT NULL COMMENT '教师评分总分',
+    `literature_review_translation_score` DECIMAL(5,2) DEFAULT NULL COMMENT '文献综述和论文翻译成绩',
+    `proposal_report_score` DECIMAL(5,2) DEFAULT NULL COMMENT '开题报告成绩',
+    `proposal_defense_score` DECIMAL(5,2) DEFAULT NULL COMMENT '开题答辩成绩',
+    `final_score` DECIMAL(5,2) DEFAULT NULL COMMENT '总评',
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uniq_paper_grades_paper_id` (`paper_id`),
+    KEY `idx_paper_grades_student_id` (`student_id`),
+    KEY `idx_paper_grades_final_score` (`final_score`),
+    CONSTRAINT `fk_paper_grades_paper_id` FOREIGN KEY (`paper_id`) REFERENCES `papers` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='论文评分成绩表';
+"""
+
+
+PAPER_BASIC_INFO_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS `paper_basic_info` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '序号（自增主键）',
+    `college` VARCHAR(128) NOT NULL COMMENT '学院',
+    `student_id` VARCHAR(64) NOT NULL COMMENT '学生学号',
+    `student_name` VARCHAR(100) NOT NULL COMMENT '学生姓名',
+    `student_major` VARCHAR(128) NOT NULL COMMENT '学生专业',
+    `class_name` VARCHAR(128) DEFAULT NULL COMMENT '班级',
+    `teacher_id` VARCHAR(64) NOT NULL COMMENT '导师工号',
+    `teacher_name` VARCHAR(100) NOT NULL COMMENT '导师姓名',
+    `teacher_title` VARCHAR(64) DEFAULT NULL COMMENT '导师职称',
+    `paper_title` VARCHAR(500) NOT NULL COMMENT '学生论文（设计）题目',
+    `paper_keywords` VARCHAR(500) DEFAULT NULL COMMENT '论文关键词',
+    `paper_source` VARCHAR(255) DEFAULT NULL COMMENT '论文来源',
+    `paper_type` VARCHAR(64) DEFAULT NULL COMMENT '论文类型',
+    `research_direction` VARCHAR(255) DEFAULT NULL COMMENT '论文研究方向',
+    `paper_language` VARCHAR(32) DEFAULT '中文' COMMENT '论文撰写语种',
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uniq_student_paper` (`student_id`, `paper_title`),
+    KEY `idx_college` (`college`),
+    KEY `idx_student_id` (`student_id`),
+    KEY `idx_teacher_id` (`teacher_id`),
+    KEY `idx_paper_type` (`paper_type`),
+    KEY `idx_research_direction` (`research_direction`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='论文基础信息汇总表';
+"""
+
+TASKS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS `tasks` (
+    `id` INT NOT NULL AUTO_INCREMENT COMMENT '自增ID',
+    `task_id` INT NOT NULL COMMENT '智能体任务ID',
+    `paper_id` INT NOT NULL COMMENT '论文ID',
+    `version` VARCHAR(20) NOT NULL COMMENT '论文版本号',
+    `oss_key` TEXT NOT NULL COMMENT '文件路径',
+    `status` VARCHAR(32) NOT NULL DEFAULT 'pending' COMMENT '任务状态',
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uniq_task_id` (`task_id`),
+    UNIQUE KEY `uniq_paper_version` (`paper_id`, `version`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='智能体任务表';
+"""
 
 PAPERS_HISTORY_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS `papers_history` (
@@ -298,7 +365,7 @@ PAPER_REVIEWS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS `paper_reviews` (
     id INT AUTO_INCREMENT PRIMARY KEY COMMENT '审阅记录ID',
     paper_id INT NOT NULL COMMENT '论文ID',
-    teacher_id INT NOT NULL COMMENT '教师ID',
+    teacher_id VARCHAR(64) NOT NULL COMMENT '教师ID',
     teacher_name VARCHAR(50) NOT NULL COMMENT '教师姓名',
     review_content TEXT NOT NULL COMMENT '审阅内容',
     review_time DATETIME NOT NULL COMMENT '审阅时间',
@@ -317,7 +384,6 @@ CREATE TABLE IF NOT EXISTS `annotations` (
     `id` INT NOT NULL AUTO_INCREMENT COMMENT '批注ID',
     `paper_id` INT NOT NULL COMMENT '所属论文ID',
     `author_id` INT NOT NULL COMMENT '批注作者ID',
-    `author_name` VARCHAR(50) NOT NULL COMMENT '批注者姓名',
     `paragraph_id` VARCHAR(50) DEFAULT NULL COMMENT '段落ID（可选）',
     `coordinates` JSON DEFAULT NULL COMMENT '坐标信息（JSON格式）',
     `content` TEXT NOT NULL COMMENT '批注内容',
@@ -334,7 +400,7 @@ CREATE TABLE IF NOT EXISTS `annotations` (
 DDL_MANAGEMENT_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS `ddl_management` (
     ddlid INT PRIMARY KEY AUTO_INCREMENT COMMENT 'DDL唯一ID',
-    teacher_id INT NOT NULL COMMENT '教师ID）',
+    teacher_id VARCHAR(64) NOT NULL COMMENT '教师ID）',
     teacher_name VARCHAR(50) NOT NULL COMMENT '教师姓名', 
     group_id INT NOT NULL COMMENT '群组ID',
     ddl_time DATETIME NOT NULL COMMENT '截止时间（精确到秒）',
@@ -407,6 +473,22 @@ CREATE TABLE IF NOT EXISTS `user_messages` (
 """
 
 
+USER_SESSIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS `user_sessions` (
+    `id` INT NOT NULL AUTO_INCREMENT COMMENT '会话ID',
+    `user_id` VARCHAR(64) NOT NULL COMMENT '用户ID',
+    `user_type` VARCHAR(20) NOT NULL COMMENT '用户类型（student/teacher/admin）',
+    `token` VARCHAR(512) NOT NULL COMMENT 'JWT令牌',
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `last_activity` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最后活动时间',
+    `is_active` BOOLEAN NOT NULL DEFAULT TRUE COMMENT '是否活跃',
+    PRIMARY KEY (`id`),
+    KEY `idx_user` (`user_id`, `user_type`),
+    KEY `idx_token` (`token`),
+    KEY `idx_active` (`is_active`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户会话管理表';
+"""
+
 def init_db(database_url: str | None = None) -> None:
     """Create base tables if missing (one-time use)."""
     url = database_url or DEFAULT_DB_URL
@@ -425,28 +507,35 @@ def init_db(database_url: str | None = None) -> None:
     try:
         with conn.cursor() as cur:
             for sql in (
+                ACCOUNT_MAPPING_TABLE_SQL,
                 SCHOOLS_TABLE_SQL,
                 DEPARTMENTS_TABLE_SQL,
                 STUDENTS_TABLE_SQL,
                 TEACHERS_TABLE_SQL,
                 ADMINS_TABLE_SQL,
+                USER_AGENT_PERMISSIONS_TABLE_SQL,
                 FILE_RECORDS_TABLE_SQL,
                 GROUPS_TABLE_SQL,
                 GROUP_MEMBERS_TABLE_SQL,
+                TASKS_TABLE_SQL,
                 PAPERS_TABLE_SQL,
+                PAPER_GRADES_TABLE_SQL,
+                PAPER_BASIC_INFO_TABLE_SQL,
                 PAPERS_HISTORY_TABLE_SQL,
                 PAPER_REVIEWS_TABLE_SQL,
                 ANNOTATIONS_TABLE_SQL,
                 DDL_MANAGEMENT_TABLE_SQL,
                 TEMPLATES_TABLE_SQL,
                 USER_MESSAGES_TABLE_SQL,
+                USER_SESSIONS_TABLE_SQL,
                 OPERATION_LOGS_TABLE_SQL,
             ):
                 cur.execute(sql)
         print(
-            "Tables ensured: schools, departments, students, teachers, admins, file_records, groups, group_members, "
-            "papers, papers_history, paper_reviews, annotations, ddl_management, templates, "
-            "user_messages, operation_logs"
+            "Tables ensured: account_mapping, schools, departments, students, teachers, admins, "
+            "user_agent_permissions, file_records, groups, group_members, tasks, "
+            "papers, paper_grades, paper_basic_info, papers_history, paper_reviews, annotations, ddl_management, templates, "
+            "user_messages, user_sessions, operation_logs"
         )
     finally:
         conn.close()
@@ -471,6 +560,23 @@ def _get_existing_indexes(conn: pymysql.connections.Connection, db_name: str, ta
 
 
 TABLE_COLUMN_DEFINITIONS = {
+    "account_mapping": {
+        "id": "`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键ID'",
+        "virtual_account": "`virtual_account` VARCHAR(128) NOT NULL COMMENT '虚拟账号，用于映射真实账号'",
+        "real_user_id": "`real_user_id` BIGINT UNSIGNED NOT NULL COMMENT '真实用户ID'",
+        "real_user_type": "`real_user_type` ENUM('student','teacher','admin') NOT NULL COMMENT '真实用户类型'",
+        "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间'",
+        "updated_at": "`updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'",
+    },
+    "user_agent_permissions": {
+        "id": "`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键ID'",
+        "student_id": "`student_id` VARCHAR(64) NOT NULL COMMENT '学生学号（关联students表的student_id）'",
+        "admin_id": "`admin_id` VARCHAR(64) NOT NULL COMMENT '管理员ID（关联admins表的admin_id）'",
+        "agent_permission": "`agent_permission` TINYINT NOT NULL DEFAULT 0 COMMENT '智能体使用权限，0-无权限，1-有权限'",
+        "granted_at": "`granted_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '赋予权限的时间'",
+        "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间'",
+        "updated_at": "`updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间'",
+    },
     "schools": {
         "id": "`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键ID'",
         "school_id": "`school_id` BIGINT UNSIGNED NOT NULL DEFAULT 1 COMMENT '学校唯一标识ID（默认值0，插入时需显式赋值）'",
@@ -490,7 +596,7 @@ TABLE_COLUMN_DEFINITIONS = {
     },
     "students": {
         "id": "`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键ID'",
-        "student_id": "`student_id` VARCHAR(20) NOT NULL COMMENT '学号'",
+        "student_id": "`student_id` VARCHAR(64) NOT NULL COMMENT '学号'",
         "name": "`name` VARCHAR(128) NOT NULL COMMENT '姓名'",
         "phone": "`phone` VARCHAR(32) DEFAULT NULL COMMENT '联系电话'",
         "email": "`email` VARCHAR(255) DEFAULT NULL COMMENT '邮箱'",
@@ -499,6 +605,8 @@ TABLE_COLUMN_DEFINITIONS = {
         "school_name": "`school_name` VARCHAR(128) NULL COMMENT '学校名称'",
         "department_id": "`department_id` BIGINT UNSIGNED NULL COMMENT '所属院系ID'",
         "department_name": "`department_name` VARCHAR(128) NULL COMMENT '院系名称'",
+        "major": "`major` VARCHAR(128) NULL COMMENT '专业'",
+        "class_name": "`class_name` VARCHAR(128) NULL COMMENT '班级'",
         "group_id": "`group_id` BIGINT UNSIGNED NULL COMMENT '所属群组ID'",
         "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间'",
         "updated_at": "`updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间'",
@@ -569,11 +677,18 @@ TABLE_COLUMN_DEFINITIONS = {
         "is_active": "`is_active` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '是否有效（用于软删除）'",
         "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间'",
     },
+    "tasks": {
+        "id": "`id` INT NOT NULL AUTO_INCREMENT COMMENT '自增ID'",
+        "task_id": "`task_id` INT NOT NULL COMMENT '智能体任务ID'",
+        "paper_id": "`paper_id` INT NOT NULL COMMENT '论文ID'",
+        "version": "`version` VARCHAR(20) NOT NULL COMMENT '论文版本号'",
+        "oss_key": "`oss_key` TEXT NOT NULL COMMENT '文件路径'",
+        "status": "`status` VARCHAR(32) NOT NULL DEFAULT 'pending' COMMENT '任务状态'",
+    },
     "papers": {
         "id": "`id` INT NOT NULL AUTO_INCREMENT COMMENT '论文ID'",
         "owner_id": "`owner_id` INT NOT NULL COMMENT '所有者ID'",
-        "teacher_id": "`teacher_id` INT NOT NULL COMMENT '老师ID'",
-        "teacher_name": "`teacher_name` VARCHAR(128) NOT NULL COMMENT '老师姓名'",
+        "teacher_id": "`teacher_id` VARCHAR(64) NOT NULL COMMENT '老师ID'",
         "version": "`version` VARCHAR(20) NOT NULL COMMENT '当前版本号'",
         "size": "`size` INT NOT NULL COMMENT '文件大小（字节）'",
         "status": "`status` VARCHAR(32) NOT NULL COMMENT '状态（uploaded:已上传, processing:处理中, completed:完成, rejected:驳回）'",
@@ -588,10 +703,46 @@ TABLE_COLUMN_DEFINITIONS = {
         "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间'",
         "updated_at": "`updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'",
     },
+    "paper_grades": {
+        "id": "`id` INT NOT NULL AUTO_INCREMENT COMMENT '自增ID'",
+        "paper_id": "`paper_id` INT NOT NULL COMMENT '论文ID'",
+        "student_id": "`student_id` VARCHAR(64) DEFAULT NULL COMMENT '学生ID'",
+        "paper_title": "`paper_title` VARCHAR(255) NOT NULL COMMENT '论文题目'",
+        "topic_significance_score": "`topic_significance_score` DECIMAL(5,2) DEFAULT NULL COMMENT '选题意义评分'",
+        "logical_ability_score": "`logical_ability_score` DECIMAL(5,2) DEFAULT NULL COMMENT '逻辑能力评分'",
+        "knowledge_application_score": "`knowledge_application_score` DECIMAL(5,2) DEFAULT NULL COMMENT '综合应用知识能力评分'",
+        "problem_analysis_solution_score": "`problem_analysis_solution_score` DECIMAL(5,2) DEFAULT NULL COMMENT '分析解决问题能力评分'",
+        "academic_norm_score": "`academic_norm_score` DECIMAL(5,2) DEFAULT NULL COMMENT '学术规范评分'",
+        "teacher_total_score": "`teacher_total_score` DECIMAL(5,2) DEFAULT NULL COMMENT '教师评分总分'",
+        "literature_review_translation_score": "`literature_review_translation_score` DECIMAL(5,2) DEFAULT NULL COMMENT '文献综述和论文翻译成绩'",
+        "proposal_report_score": "`proposal_report_score` DECIMAL(5,2) DEFAULT NULL COMMENT '开题报告成绩'",
+        "proposal_defense_score": "`proposal_defense_score` DECIMAL(5,2) DEFAULT NULL COMMENT '开题答辩成绩'",
+        "final_score": "`final_score` DECIMAL(5,2) DEFAULT NULL COMMENT '总评'",
+        "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间'",
+        "updated_at": "`updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间'",
+    },
+    "paper_basic_info": {
+        "id": "`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '序号（自增主键）'",
+        "college": "`college` VARCHAR(128) NOT NULL COMMENT '学院'",
+        "student_id": "`student_id` VARCHAR(64) NOT NULL COMMENT '学生学号'",
+        "student_name": "`student_name` VARCHAR(100) NOT NULL COMMENT '学生姓名'",
+        "student_major": "`student_major` VARCHAR(128) NOT NULL COMMENT '学生专业'",
+        "class_name": "`class_name` VARCHAR(128) DEFAULT NULL COMMENT '班级'",
+        "teacher_id": "`teacher_id` VARCHAR(64) NOT NULL COMMENT '导师工号'",
+        "teacher_name": "`teacher_name` VARCHAR(100) NOT NULL COMMENT '导师姓名'",
+        "teacher_title": "`teacher_title` VARCHAR(64) DEFAULT NULL COMMENT '导师职称'",
+        "paper_title": "`paper_title` VARCHAR(500) NOT NULL COMMENT '学生论文（设计）题目'",
+        "paper_keywords": "`paper_keywords` VARCHAR(500) DEFAULT NULL COMMENT '论文关键词'",
+        "paper_source": "`paper_source` VARCHAR(255) DEFAULT NULL COMMENT '论文来源'",
+        "paper_type": "`paper_type` VARCHAR(64) DEFAULT NULL COMMENT '论文类型'",
+        "research_direction": "`research_direction` VARCHAR(255) DEFAULT NULL COMMENT '论文研究方向'",
+        "paper_language": "`paper_language` VARCHAR(32) DEFAULT '中文' COMMENT '论文撰写语种'",
+        "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间'",
+        "updated_at": "`updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'",
+    },
     "papers_history": {
         "id": "`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '历史版本ID'",
         "paper_id": "`paper_id` INT NOT NULL COMMENT '论文ID'",
-        "teacher_name": "`teacher_name` VARCHAR(128) NOT NULL COMMENT '老师姓名'",
         "version": "`version` VARCHAR(20) NOT NULL COMMENT '历史版本号'",
         "size": "`size` INT NOT NULL COMMENT '文件大小（字节）'",
         "status": "`status` VARCHAR(32) NOT NULL COMMENT '状态（如uploaded, processing, completed等）'",
@@ -609,7 +760,7 @@ TABLE_COLUMN_DEFINITIONS = {
     "paper_reviews": {
         "id": "`id` INT AUTO_INCREMENT COMMENT '审阅记录ID'",
         "paper_id": "`paper_id` INT NOT NULL COMMENT '论文ID'",
-        "teacher_id": "`teacher_id` INT NOT NULL COMMENT '教师ID'",
+        "teacher_id": "`teacher_id` VARCHAR(64) NOT NULL COMMENT '教师ID'",
         "teacher_name": "`teacher_name` VARCHAR(50) NOT NULL COMMENT '教师姓名'",
         "review_content": "`review_content` TEXT NOT NULL COMMENT '审阅内容'",
         "review_time": "`review_time` DATETIME NOT NULL COMMENT '审阅时间'",
@@ -621,7 +772,6 @@ TABLE_COLUMN_DEFINITIONS = {
         "id": "`id` INT NOT NULL AUTO_INCREMENT COMMENT '批注ID'",
         "paper_id": "`paper_id` INT NOT NULL COMMENT '所属论文ID'",
         "author_id": "`author_id` INT NOT NULL COMMENT '批注作者ID'",
-        "author_name": "`author_name` VARCHAR(50) NOT NULL COMMENT '批注者姓名'",
         "paragraph_id": "`paragraph_id` VARCHAR(50) DEFAULT NULL COMMENT '段落ID（可选）'",
         "coordinates": "`coordinates` JSON DEFAULT NULL COMMENT '坐标信息（JSON格式）'",
         "content": "`content` TEXT NOT NULL COMMENT '批注内容'",
@@ -630,7 +780,7 @@ TABLE_COLUMN_DEFINITIONS = {
     },
     "ddl_management": {
         "ddlid": "`ddlid` INT AUTO_INCREMENT COMMENT 'DDL唯一ID'",
-        "teacher_id": "`teacher_id` INT NOT NULL COMMENT '教师ID）'",
+        "teacher_id": "`teacher_id` VARCHAR(64) NOT NULL COMMENT '教师ID）'",
         "teacher_name": "`teacher_name` VARCHAR(50) NOT NULL COMMENT '教师姓名'",
         "group_id": "`group_id` INT NOT NULL COMMENT '群组ID'",
         "ddl_time": "`ddl_time` DATETIME NOT NULL COMMENT '截止时间（精确到秒）'",
@@ -674,9 +824,32 @@ TABLE_COLUMN_DEFINITIONS = {
         "updated_at": "`updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间'",
         "status": "`status` VARCHAR(16) NOT NULL DEFAULT 'success' COMMENT '操作状态（success/failure）'",
     },
+    "user_sessions": {
+        "id": "`id` INT NOT NULL AUTO_INCREMENT COMMENT '会话ID'",
+        "user_id": "`user_id` VARCHAR(64) NOT NULL COMMENT '用户ID'",
+        "user_type": "`user_type` VARCHAR(20) NOT NULL COMMENT '用户类型（student/teacher/admin）'",
+        "token": "`token` VARCHAR(512) NOT NULL COMMENT 'JWT令牌'",
+        "created_at": "`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间'",
+        "last_activity": "`last_activity` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最后活动时间'",
+        "is_active": "`is_active` BOOLEAN NOT NULL DEFAULT TRUE COMMENT '是否活跃'",
+    },
 }
 
 TABLE_INDEX_DEFINITIONS = {
+    "account_mapping": [
+        "CREATE UNIQUE INDEX uniq_virtual_account ON `account_mapping` (virtual_account)",
+        "CREATE INDEX idx_real_user ON `account_mapping` (real_user_id, real_user_type)"
+    ],
+    "user_agent_permissions": [
+        "CREATE UNIQUE INDEX uniq_student ON `user_agent_permissions` (student_id)",
+        "CREATE INDEX idx_admin_id ON `user_agent_permissions` (admin_id)",
+        "CREATE INDEX idx_agent_permission ON `user_agent_permissions` (agent_permission)",
+        "CREATE INDEX idx_granted_at ON `user_agent_permissions` (granted_at)"
+    ],
+    "tasks": [
+        "CREATE UNIQUE INDEX uniq_task_id ON `tasks` (task_id)",
+        "CREATE UNIQUE INDEX uniq_paper_version ON `tasks` (paper_id, version)"
+    ],
     "schools": [
         "CREATE UNIQUE INDEX uniq_school_id ON `schools` (school_id)",
         "CREATE INDEX idx_school_name ON `schools` (school_name)"
@@ -735,14 +908,25 @@ TABLE_INDEX_DEFINITIONS = {
     "papers": [
         "CREATE INDEX idx_owner_id ON `papers` (owner_id)",
         "CREATE INDEX idx_teacher_id ON `papers` (teacher_id)",
-        "CREATE INDEX idx_teacher_name ON `papers` (teacher_name)",
         "CREATE INDEX idx_version ON `papers` (version)",
         "CREATE INDEX idx_status ON `papers` (status)",
         "CREATE INDEX idx_operated_time ON `papers` (operated_time)"
     ],
+    "paper_grades": [
+        "CREATE UNIQUE INDEX uniq_paper_grades_paper_id ON `paper_grades` (paper_id)",
+        "CREATE INDEX idx_paper_grades_student_id ON `paper_grades` (student_id)",
+        "CREATE INDEX idx_paper_grades_final_score ON `paper_grades` (final_score)"
+    ],
+    "paper_basic_info": [
+        "CREATE UNIQUE INDEX uniq_student_paper ON `paper_basic_info` (student_id, paper_title)",
+        "CREATE INDEX idx_college ON `paper_basic_info` (college)",
+        "CREATE INDEX idx_student_id ON `paper_basic_info` (student_id)",
+        "CREATE INDEX idx_teacher_id ON `paper_basic_info` (teacher_id)",
+        "CREATE INDEX idx_paper_type ON `paper_basic_info` (paper_type)",
+        "CREATE INDEX idx_research_direction ON `paper_basic_info` (research_direction)"
+    ],
     "papers_history": [
         "CREATE INDEX idx_papers_history_paper_id ON `papers_history` (paper_id)",
-        "CREATE INDEX idx_papers_history_teacher_name ON `papers_history` (teacher_name)",
         "CREATE INDEX idx_papers_history_version ON `papers_history` (version)",
         "CREATE INDEX idx_papers_history_status ON `papers_history` (status)",
         "CREATE INDEX idx_papers_history_created_at ON `papers_history` (created_at)"
@@ -753,8 +937,8 @@ TABLE_INDEX_DEFINITIONS = {
         "CREATE INDEX idx_paper_teacher ON `paper_reviews` (paper_id, teacher_id)"
     ],
     "annotations": [
-        "CREATE INDEX idx_annotations_paper_id ON `annotations` (paper_id)",
-        "CREATE INDEX idx_annotations_author_id ON `annotations` (author_id)"
+        "CREATE INDEX idx_paper_id ON `annotations` (paper_id)",
+        "CREATE INDEX idx_author_id ON `annotations` (author_id)"
     ],
     "ddl_management": [
         "CREATE INDEX idx_teacher_id ON `ddl_management` (teacher_id)",
@@ -772,8 +956,13 @@ TABLE_INDEX_DEFINITIONS = {
         "CREATE INDEX idx_user_messages_received_time ON `user_messages` (received_time)"
     ],
     "operation_logs": [
-        "CREATE INDEX idx_operation_logs_user_id ON `operation_logs` (user_id)",
-        "CREATE INDEX idx_operation_logs_time ON `operation_logs` (operation_time)"
+        "CREATE INDEX idx_user_id ON `operation_logs` (user_id)",
+        "CREATE INDEX idx_operation_time ON `operation_logs` (operation_time)"
+    ],
+    "user_sessions": [
+        "CREATE INDEX idx_user ON `user_sessions` (user_id, user_type)",
+        "CREATE INDEX idx_token ON `user_sessions` (token)",
+        "CREATE INDEX idx_active ON `user_sessions` (is_active)"
     ],
 }
 
@@ -802,16 +991,20 @@ def sync_schema(database_url: str | None = None) -> None:
                 STUDENTS_TABLE_SQL,
                 TEACHERS_TABLE_SQL,
                 ADMINS_TABLE_SQL,
+                USER_AGENT_PERMISSIONS_TABLE_SQL,
                 FILE_RECORDS_TABLE_SQL,
                 GROUPS_TABLE_SQL,
                 GROUP_MEMBERS_TABLE_SQL,
                 PAPERS_TABLE_SQL,
+                PAPER_GRADES_TABLE_SQL,
+                PAPER_BASIC_INFO_TABLE_SQL,
                 PAPERS_HISTORY_TABLE_SQL,
                 PAPER_REVIEWS_TABLE_SQL,
                 ANNOTATIONS_TABLE_SQL,
                 DDL_MANAGEMENT_TABLE_SQL,
                 TEMPLATES_TABLE_SQL,
                 USER_MESSAGES_TABLE_SQL,
+                USER_SESSIONS_TABLE_SQL,
                 OPERATION_LOGS_TABLE_SQL,
             ):
                 cur.execute(sql)
@@ -839,6 +1032,25 @@ def sync_schema(database_url: str | None = None) -> None:
                 if col_def:
                     with conn.cursor() as cur:
                         cur.execute(f"ALTER TABLE `{table}` MODIFY COLUMN {col_def};")
+
+        # Align changed ID column types for string IDs
+        schema_fix_columns = {
+            "papers": ["teacher_id"],
+            "paper_grades": ["student_id"],
+            "paper_reviews": ["teacher_id"],
+            "ddl_management": ["teacher_id"],
+        }
+        for table, col_names in schema_fix_columns.items():
+            for col_name in col_names:
+                col_def = TABLE_COLUMN_DEFINITIONS.get(table, {}).get(col_name)
+                if col_def:
+                    with conn.cursor() as cur:
+                        cur.execute(f"ALTER TABLE `{table}` MODIFY COLUMN {col_def};")
+
+        # Align user_sessions column definitions
+        for col_def in TABLE_COLUMN_DEFINITIONS.get("user_sessions", {}).values():
+            with conn.cursor() as cur:
+                cur.execute(f"ALTER TABLE `user_sessions` MODIFY COLUMN {col_def};")
 
         # Ensure enum definition for group_members.role includes owner
         with conn.cursor() as cur:
@@ -889,3 +1101,4 @@ def sync_schema(database_url: str | None = None) -> None:
 
 if __name__ == "__main__":
     sync_schema()
+

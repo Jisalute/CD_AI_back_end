@@ -1,6 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Body
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import csv
 import io
 import pymysql
@@ -19,9 +20,11 @@ from app.schemas.user import (
     LoginResponse,
 )
 from app.database import get_db
-from app.core.dependencies import get_current_user
-from app.core.security import create_access_token, get_password_hash, verify_password
+from app.core.security import create_access_token, get_password_hash, verify_password, decode_access_token
 from loguru import logger
+import pandas as pd
+
+security = HTTPBearer()
 
 
 def _parse_current_user(current_user: Optional[str]) -> dict:
@@ -85,7 +88,7 @@ class UserBindDepartment(BaseModel):
     department_name: Optional[str] = None 
 
 router = APIRouter()
-SUPPORTED_IMPORT_EXTS = (".csv", ".tsv")
+SUPPORTED_IMPORT_EXTS = (".csv", ".tsv", ".xlsx")
 
 USER_TABLES = {
     "admin": {"table": "admins", "id_col": "admin_id", "role_col": "role"},
@@ -123,7 +126,7 @@ def _fetch_user_for_login(
     if user_type == "admin":
         cursor.execute(
             f"""
-            SELECT id, {id_col} as username, name as full_name, phone, email, role,
+            SELECT id, {id_col} as username, {id_col} as user_specific_id, name as full_name, phone, email, role,
                    password,
                    DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') as created_at,
                    DATE_FORMAT(updated_at, '%%Y-%%m-%%d %%H:%%i:%%s') as updated_at
@@ -134,7 +137,7 @@ def _fetch_user_for_login(
     else:
         cursor.execute(
             f"""
-            SELECT id, {id_col} as username, name as full_name, phone, email,
+            SELECT id, {id_col} as username, {id_col} as user_specific_id, name as full_name, phone, email,
                    password,
                    DATE_FORMAT(created_at, '%%Y-%%m-%%d %%H:%%i:%%s') as created_at,
                    DATE_FORMAT(updated_at, '%%Y-%%m-%%d %%H:%%i:%%s') as updated_at
@@ -151,7 +154,8 @@ def _fetch_user_for_login(
 
 
 def _normalize_user_type(user_type: str | None) -> str:
-    value = (user_type or "admin").strip().lower()
+    user_type_str = str(user_type) if user_type is not None else "admin"
+    value = user_type_str.strip().lower()
     if value not in USER_TABLES:
         raise HTTPException(status_code=400, detail="user_type 必须为 student/teacher/admin")
     return value
@@ -689,15 +693,54 @@ def user_bind_department(
     description="根据当前登录用户信息返回用户表中的全部字段（不包含密码）",
 )
 def get_current_user_info(
-    current_user: dict = Depends(get_current_user),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
     db: pymysql.connections.Connection = Depends(get_db),
 ):
     cursor = None
     try:
-        user_id = current_user.get("sub")
+        token = credentials.credentials
+        payload = decode_access_token(token)
+        
+        if payload is None:
+            raise HTTPException(
+                status_code=401,
+                detail="无效的认证凭据",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # 验证会话是否活跃
+        user_id = payload.get("sub")
         if not user_id:
-            raise HTTPException(status_code=401, detail="请先登录")
-        user_type = _resolve_user_type_from_payload(current_user)
+            raise HTTPException(
+                status_code=401,
+                detail="无效的用户ID",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        user_type = payload.get("user_type")
+        
+        # 检查会话是否存在且活跃
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT is_active FROM user_sessions WHERE token = %s AND user_id = %s AND user_type = %s",
+            (token, user_id, user_type)
+        )
+        session = cursor.fetchone()
+        
+        if not session or not session[0]:
+            raise HTTPException(
+                status_code=401,
+                detail="该账号已在别处登录，若非本人操作，请及时修改密码",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # 更新最后活动时间
+        cursor.execute(
+            "UPDATE user_sessions SET last_activity = CURRENT_TIMESTAMP WHERE token = %s",
+            (token,)
+        )
+        
+        # 获取用户信息
+        user_type = _resolve_user_type_from_payload(payload)
         info = USER_TABLES[user_type]
         table = info["table"]
         cursor = db.cursor(pymysql.cursors.DictCursor)
@@ -710,8 +753,139 @@ def get_current_user_info(
     except HTTPException:
         raise
     except pymysql.MySQLError as e:
+        db.rollback()
         logger.error(f"获取用户信息数据库错误: {str(e)}")
         raise HTTPException(status_code=500, detail="获取用户信息失败")
+    finally:
+        if cursor:
+            cursor.close()
+
+
+@router.get(
+    "/check-session",
+    summary="检查用户会话状态",
+    description="检查用户会话是否活跃，用于实现单点登录功能"
+)
+def check_session(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: pymysql.connections.Connection = Depends(get_db),
+):
+    """
+    检查用户会话状态，用于实现单点登录功能
+    
+    - 验证 JWT 令牌的有效性
+    - 检查会话是否存在且活跃
+    - 如果会话不存在或不活跃，返回 401 错误
+    """
+    cursor = None
+    try:
+        token = credentials.credentials
+        payload = decode_access_token(token)
+        
+        if payload is None:
+            raise HTTPException(
+                status_code=401,
+                detail="无效的认证凭据",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # 验证会话是否活跃
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(
+                status_code=401,
+                detail="无效的用户ID",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        user_type = payload.get("user_type")
+        
+        # 检查会话是否存在且活跃（使用时间复杂度最小的方式：直接通过token、user_id、user_type查询）
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT is_active FROM user_sessions WHERE token = %s AND user_id = %s AND user_type = %s",
+            (token, user_id, user_type)
+        )
+        session = cursor.fetchone()
+        
+        if not session or not session[0]:
+            # 会话不存在或不活跃（被顶号）
+            raise HTTPException(
+                status_code=401,
+                detail="账号已在别处登录，若非本人操作，请及时更改密码",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # 会话活跃，更新最后活动时间
+        cursor.execute(
+            "UPDATE user_sessions SET last_activity = CURRENT_TIMESTAMP WHERE token = %s",
+            (token,)
+        )
+        db.commit()
+        
+        return {
+            "status": "active",
+            "message": "会话活跃",
+            "user_id": user_id,
+            "user_type": user_type
+        }
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        db.rollback()
+        logger.error(f"检查会话状态数据库错误: {str(e)}")
+        raise HTTPException(status_code=500, detail="检查会话状态失败")
+    finally:
+        if cursor:
+            cursor.close()
+
+
+@router.post(
+    "/clear-expired-sessions",
+    summary="清除过期会话",
+    description="清除指定用户的过期会话（is_active=0且创建时间超过2小时）"
+)
+def clear_expired_sessions(
+    user_id: str = Query(..., description="用户专门的ID，如student_id、teacher_id、admin_id"),
+    user_type: str = Query(..., description="用户类型（student/teacher/admin）"),
+    db: pymysql.connections.Connection = Depends(get_db),
+):
+    """
+    清除指定用户的过期会话
+    
+    - 只删除创建时间超过2小时的过期会话（is_active=0）
+    - 保留近期的过期会话，用于顶号判断
+    - 用于登录时清理旧的过期会话，避免数据库膨胀
+    - user_id参数为用户专门的ID，如student_id、teacher_id、admin_id
+    """
+    cursor = None
+    try:
+        cursor = db.cursor()
+        
+        # 只删除创建时间超过2小时的过期会话
+        cursor.execute(
+            """
+            DELETE FROM user_sessions 
+            WHERE user_id = %s 
+            AND user_type = %s 
+            AND is_active = 0 
+            AND created_at < DATE_SUB(NOW(), INTERVAL 2 HOUR)
+            """,
+            (user_id, user_type)
+        )
+        
+        cleared_count = cursor.rowcount
+        db.commit()
+        
+        return {
+            "message": f"已清除 {cleared_count} 个过期会话",
+            "cleared_count": cleared_count,
+            "user_id": user_id,
+            "user_type": user_type
+        }
+    except pymysql.MySQLError as e:
+        db.rollback()
+        logger.error(f"清除过期会话数据库错误: {str(e)}")
+        raise HTTPException(status_code=500, detail="清除过期会话失败")
     finally:
         if cursor:
             cursor.close()
@@ -755,7 +929,7 @@ def login_user(payload: LoginRequest, db: pymysql.connections.Connection = Depen
             table = info["table"]
             id_col = info["id_col"]
             cursor.execute(
-                f"SELECT id, {id_col} as username, name as full_name, phone, email, role, password, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') as updated_at FROM {table} WHERE id = %s",
+                f"SELECT id, {id_col} as username, {id_col} as user_specific_id, name as full_name, phone, email, role, password, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at, DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') as updated_at FROM {table} WHERE id = %s",
                 (real_user_id,)
             )
             row = cursor.fetchone()
@@ -765,13 +939,31 @@ def login_user(payload: LoginRequest, db: pymysql.connections.Connection = Depen
             if not password_hash or not verify_password(payload.password, password_hash):
                 raise HTTPException(status_code=401, detail="用户名或密码错误")
             role = row.get("role") or real_user_type
+            # 使用用户专门的ID
+            user_specific_id = row.get("user_specific_id") or row.get("id")
             token_payload = {
-                "sub": row["id"],
+                "sub": user_specific_id,
                 "username": row["username"],
                 "roles": [role],
                 "user_type": real_user_type,
             }
             access_token = create_access_token(token_payload)
+            
+            # 单点登录：禁用该用户的所有现有会话
+            cursor.execute(
+                "UPDATE user_sessions SET is_active = FALSE WHERE user_id = %s AND user_type = %s",
+                (user_specific_id, real_user_type)
+            )
+            
+            # 创建新会话
+            cursor.execute(
+                "INSERT INTO user_sessions (user_id, user_type, token) VALUES (%s, %s, %s)",
+                (user_specific_id, real_user_type, access_token)
+            )
+            
+            # 提交事务
+            db.commit()
+            
             row.pop("password", None)
             user_out = UserOut(**row)
             return LoginResponse(access_token=access_token, user=user_out)
@@ -800,19 +992,41 @@ def login_user(payload: LoginRequest, db: pymysql.connections.Connection = Depen
             raise HTTPException(status_code=400, detail="账号在多个用户类型中匹配，请指定 user_type")
         user_type, row = matched[0]
         role = row.get("role") or user_type
+        # 使用用户专门的ID
+        user_specific_id = row.get("user_specific_id") or row.get("id")
         token_payload = {
-            "sub": row["id"],
+            "sub": user_specific_id,
             "username": row["username"],
             "roles": [role],
             "user_type": user_type,
         }
         access_token = create_access_token(token_payload)
+        
+        # 单点登录：禁用该用户的所有现有会话
+        cursor.execute(
+            "UPDATE user_sessions SET is_active = FALSE WHERE user_id = %s AND user_type = %s",
+            (user_specific_id, user_type)
+        )
+        
+        # 创建新会话
+        cursor.execute(
+            "INSERT INTO user_sessions (user_id, user_type, token) VALUES (%s, %s, %s)",
+            (user_specific_id, user_type, access_token)
+        )
+        
+        # 提交事务
+        db.commit()
+        
         row.pop("password", None)
         user_out = UserOut(**row)
         return LoginResponse(access_token=access_token, user=user_out)
     except HTTPException:
+        # 回滚事务
+        db.rollback()
         raise
     except pymysql.MySQLError as e:
+        # 回滚事务
+        db.rollback()
         logger.error(f"用户登录数据库错误: {str(e)}")
         raise HTTPException(status_code=500, detail="登录失败")
     finally:
@@ -1145,6 +1359,9 @@ def create_teacher(payload: TeacherCreate, db: pymysql.connections.Connection = 
         username = payload.username.strip()
         if not username:
             raise HTTPException(status_code=400, detail="username 不能为空")
+        # 校验教师工号第一个字符必须是 't'
+        if not username.startswith('t') and not username.startswith('T'):
+            raise HTTPException(status_code=400, detail="教师username第一个字符必须是 't' 或 'T'")
         # 处理默认值
         full_name = payload.full_name or username
         raw_password = payload.password or "123456"
@@ -1206,6 +1423,9 @@ def create_admin(payload: AdminCreate, db: pymysql.connections.Connection = Depe
         username = payload.username.strip()
         if not username:
             raise HTTPException(status_code=400, detail="username 不能为空")
+        # 校验管理员账号第一个字符必须是 'a'
+        if not username.startswith('a') and not username.startswith('A'):
+            raise HTTPException(status_code=400, detail="管理员username第一个字符必须是 'a' 或 'A'")
         # 处理默认值
         full_name = payload.full_name or username
         raw_password = payload.password or "123456"
@@ -1355,31 +1575,70 @@ def delete_user(
 @router.post(
     "/import",
     summary="一键导入用户",
-    description="上传 CSV/TSV 文件批量导入用户（列：username,user_type,full_name,role,password 可选）"
+    description="上传 CSV/TSV/XLSX 文件批量导入用户（列：用户名,角色类型,全名,密码）"
 )
 async def import_users(file: UploadFile = File(...), db: pymysql.connections.Connection = Depends(get_db)):
     filename = file.filename or ""
     lower_name = filename.lower()
     if not lower_name.endswith(SUPPORTED_IMPORT_EXTS):
-        raise HTTPException(status_code=400, detail="仅支持 .csv 或 .tsv 文件")
+        raise HTTPException(status_code=400, detail=f"仅支持 {', '.join(SUPPORTED_IMPORT_EXTS)} 文件")
 
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="上传文件为空")
 
-    delimiter = "\t" if lower_name.endswith(".tsv") else ","
-    try:
-        text = content.decode("utf-8-sig")
-    except UnicodeDecodeError:
+    rows = []
+    
+    # 处理不同文件类型
+    if lower_name.endswith(('.xlsx', '.xls')):
+        # 处理Excel文件：核心修复1：避免科学计数法，完整保留数字
+        # 读取时指定 dtype=str，强制所有单元格为字符串，彻底解决科学计数法问题
+        df = pd.read_excel(io.BytesIO(content), dtype=str)
+        
+        # 核心修复2：处理列名，避免int类型strip报错
+        df.columns = [
+            str(col).strip() if pd.notna(col) else "" 
+            for col in df.columns
+        ]
+        
+        # 检查必填列
+        required_cols = ["用户名", "角色类型", "全名", "密码"]
+        extra = [col for col in df.columns if col not in required_cols]
+        if extra:
+            raise HTTPException(status_code=400, detail=f"文件表头只能包含：用户名,角色类型,全名,密码。发现额外列：{', '.join(extra)}")
+        missing = [col for col in required_cols if col not in df.columns]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"文件表头必须为中文，缺少列：{', '.join(missing)}。请使用中文表头：用户名,角色类型,全名,密码")
+        
+        # 核心修复3：清理所有单元格的空值和空格，确保所有数据为字符串
+        df = df.fillna("").astype(str)
+        for col in df.columns:
+            df[col] = df[col].str.strip()
+        
+        # 转换为字典列表
+        rows = df.to_dict(orient="records")
+    else:
+        # 处理CSV/TSV文件
+        delimiter = "\t" if lower_name.endswith(".tsv") else ","
         try:
-            text = content.decode("gbk")
+            text = content.decode("utf-8-sig")
         except UnicodeDecodeError:
-            raise HTTPException(status_code=400, detail="文件编码仅支持 UTF-8 或 GBK")
+            try:
+                text = content.decode("gbk")
+            except UnicodeDecodeError:
+                raise HTTPException(status_code=400, detail="文件编码仅支持 UTF-8 或 GBK")
 
-    reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
-    required_col = "username"
-    if required_col not in reader.fieldnames:
-        raise HTTPException(status_code=400, detail="文件缺少 username 列")
+        reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+        if reader.fieldnames is None:
+            raise HTTPException(status_code=400, detail="CSV 文件缺少标题行或文件为空")
+        required_cols = ["用户名", "角色类型", "全名", "密码"]
+        extra = [col for col in reader.fieldnames if col not in required_cols]
+        if extra:
+            raise HTTPException(status_code=400, detail=f"文件表头只能包含：用户名,角色类型,全名,密码。发现额外列：{', '.join(extra)}")
+        missing = [col for col in required_cols if col not in reader.fieldnames]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"文件表头必须为中文，缺少列：{', '.join(missing)}。请使用中文表头：用户名,角色类型,全名,密码")
+        rows = list(reader)
 
     created, updated = 0, 0
     default_role = "admin"
@@ -1389,17 +1648,28 @@ async def import_users(file: UploadFile = File(...), db: pymysql.connections.Con
     updated_items = []
     try:
         cursor = db.cursor()
-        for row in reader:
-            username = (row.get("username") or "").strip()
+        for row in rows:
+            # 核心修复4：增强safe_get_str，彻底避免int/float类型strip报错
+            def safe_get_str(key):
+                val = row.get(key)
+                if val is None or pd.isna(val):
+                    return ""
+                # 统一转字符串，彻底避免类型错误
+                s = str(val)
+                return s.strip()
+            
+            username = safe_get_str("用户名")
             if not username:
                 continue
-            user_type = _normalize_user_type(row.get("user_type") or "admin")
+            
+            user_type_val = safe_get_str("角色类型")
+            if not user_type_val:
+                raise HTTPException(status_code=400, detail="文件中有用户类型为空")
+            user_type = _normalize_user_type(user_type_val)
             info = USER_TABLES[user_type]
             table = info["table"]
-            phone = (row.get("phone") or None) and row.get("phone").strip()
             email = "string"
-            full_name = (row.get("full_name") or None) and row.get("full_name").strip()
-            role = (row.get("role") or default_role).strip() or default_role
+            full_name = safe_get_str("全名")
             password = (row.get("password") or default_password).strip() or default_password
             password_hash = get_password_hash(password)
             if not full_name:
@@ -1407,45 +1677,42 @@ async def import_users(file: UploadFile = File(...), db: pymysql.connections.Con
             if user_type == "admin":
                 cursor.execute(
                     """
-                    INSERT INTO admins (admin_id, name, phone, email, role, password)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO admins (admin_id, name, email, role, password)
+                    VALUES (%s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
                         name = VALUES(name),
-                        phone = VALUES(phone),
                         email = VALUES(email),
                         role = VALUES(role),
                         password = VALUES(password),
                         updated_at = NOW()
                     """,
-                    (username, full_name, phone, email, role, password_hash),
+                    (username, full_name, email, default_role, password_hash),
                 )
             elif user_type == "student":
                 cursor.execute(
                     """
-                    INSERT INTO students (student_id, name, phone, email, password)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO students (student_id, name, email, password)
+                    VALUES (%s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
                         name = VALUES(name),
-                        phone = VALUES(phone),
                         email = VALUES(email),
                         password = VALUES(password),
                         updated_at = NOW()
                     """,
-                    (username, full_name, phone, email, password_hash),
+                    (username, full_name, email, password_hash),
                 )
             else:
                 cursor.execute(
                     """
-                    INSERT INTO teachers (teacher_id, name, phone, email, password)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO teachers (teacher_id, name, email, password)
+                    VALUES (%s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
                         name = VALUES(name),
-                        phone = VALUES(phone),
                         email = VALUES(email),
                         password = VALUES(password),
                         updated_at = NOW()
                     """,
-                    (username, full_name, phone, email, password_hash),
+                    (username, full_name, email, password_hash),
                 )
             if cursor.rowcount == 1:
                 created += 1
@@ -1488,6 +1755,306 @@ async def import_users(file: UploadFile = File(...), db: pymysql.connections.Con
         if cursor:
             cursor.close()
 
+
+@router.post(
+    "/import/cjlu-info",
+    summary="中国计量大学信息工程学院专用一键导入",
+    description="""上传 CSV/TSV/XLSX 文件批量导入学生和教师（针对中国计量大学信息工程学院专用）
+    支持的表头列：学号,姓名,学年,学期,年级,课题主管学院,学生学院,专业名称,班级,课题名称,课题类型,课题性质,课题来源,指导教师工号,指导教师姓名,指导教师职称,答辩记录上传状态,合成状态,录入状态,五级制总成绩,百分制总成绩,是否重修成绩,论文指导教师成绩,论文指导教师成绩比例,评阅老师成绩,评阅老师成绩比例,论文二次答辩成绩,论文二次答辩成绩比例,开题报告二次答辩成绩,开题报告二次答辩成绩比例,论文答辩成绩,论文答辩成绩比例,中期报告成绩,中期报告成绩比例,论文初稿成绩,论文初稿成绩比例,外文翻译成绩,外文翻译成绩比例,文献综述成绩,文献综述成绩比例,开题报告答辩成绩,开题报告答辩成绩比例
+    
+    导入规则：
+    - 学生：学号作为用户名，角色类型默认student，姓名作为全名，密码默认123456
+    - 教师：指导教师工号前加"t"作为用户名，角色类型默认teacher，指导教师姓名作为全名，密码默认123456
+    """
+)
+async def import_cjlu_info_users(file: UploadFile = File(...), db: pymysql.connections.Connection = Depends(get_db)):
+    filename = file.filename or ""
+    lower_name = filename.lower()
+    if not lower_name.endswith(SUPPORTED_IMPORT_EXTS):
+        raise HTTPException(status_code=400, detail=f"仅支持 {', '.join(SUPPORTED_IMPORT_EXTS)} 文件")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+
+    rows = []
+    
+    # 处理不同文件类型
+    if lower_name.endswith(('.xlsx', '.xls')):
+        # 读取时指定 dtype=str，强制所有单元格为字符串，避免科学计数法问题
+        df = pd.read_excel(io.BytesIO(content), dtype=str)
+        
+        # 处理列名，避免int类型strip报错
+        df.columns = [
+            str(col).strip() if pd.notna(col) else "" 
+            for col in df.columns
+        ]
+        
+        # 检查必填列
+        required_cols = ["学号", "姓名", "指导教师工号", "指导教师姓名"]
+        missing = [col for col in required_cols if col not in df.columns]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"文件表头缺少必填列：{', '.join(missing)}。必填列：学号,姓名,指导教师工号,指导教师姓名")
+        
+        # 清理所有单元格的空值和空格，确保所有数据为字符串
+        df = df.fillna("").astype(str)
+        for col in df.columns:
+            df[col] = df[col].str.strip()
+        
+        # 转换为字典列表
+        rows = df.to_dict(orient="records")
+    else:
+        # 处理CSV/TSV文件
+        delimiter = "\t" if lower_name.endswith(".tsv") else ","
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                text = content.decode("gbk")
+            except UnicodeDecodeError:
+                raise HTTPException(status_code=400, detail="文件编码仅支持 UTF-8 或 GBK")
+
+        reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+        if reader.fieldnames is None:
+            raise HTTPException(status_code=400, detail="CSV 文件缺少标题行或文件为空")
+        required_cols = ["学号", "姓名", "指导教师工号", "指导教师姓名"]
+        missing = [col for col in required_cols if col not in reader.fieldnames]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"文件表头缺少必填列：{', '.join(missing)}。必填列：学号,姓名,指导教师工号,指导教师姓名")
+        rows = list(reader)
+
+    default_password = "123456"
+    cursor = None
+    created_students = 0
+    updated_students = 0
+    created_teachers = 0
+    updated_teachers = 0
+    created_student_items = []
+    updated_student_items = []
+    created_teacher_items = []
+    updated_teacher_items = []
+    
+    # 用于去重的集合
+    processed_students = set()
+    processed_teachers = set()
+    
+    try:
+        cursor = db.cursor()
+        
+        for row in rows:
+            # 安全获取字符串值
+            def safe_get_str(key):
+                val = row.get(key)
+                if val is None or pd.isna(val):
+                    return ""
+                s = str(val)
+                return s.strip()
+            
+            # 处理学生数据
+            student_id = safe_get_str("学号")
+            student_name = safe_get_str("姓名")
+            
+            if student_id and student_id not in processed_students:
+                processed_students.add(student_id)
+                email = "string"
+                password_hash = get_password_hash(default_password)
+                full_name = student_name if student_name else student_id
+                
+                cursor.execute(
+                    """
+                    INSERT INTO students (student_id, name, email, password)
+                    VALUES (%s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        name = VALUES(name),
+                        email = VALUES(email),
+                        password = VALUES(password),
+                        updated_at = NOW()
+                    """,
+                    (student_id, full_name, email, password_hash),
+                )
+                
+                # 获取记录ID
+                cursor.execute("SELECT id FROM students WHERE student_id = %s", (student_id,))
+                rid = cursor.fetchone()
+                rec_id = rid[0] if rid else None
+                
+                if cursor.rowcount == 1:
+                    created_students += 1
+                    created_student_items.append({"user_type": "student", "username": student_id, "name": full_name, "id": rec_id})
+                else:
+                    updated_students += 1
+                    updated_student_items.append({"user_type": "student", "username": student_id, "name": full_name, "id": rec_id})
+            
+            # 处理教师数据
+            teacher_gh = safe_get_str("指导教师工号")
+            teacher_name = safe_get_str("指导教师姓名")
+            
+            if teacher_gh and teacher_gh not in processed_teachers:
+                processed_teachers.add(teacher_gh)
+                # 教师用户名：在工号前加"t"
+                teacher_username = "t" + teacher_gh
+                email = "string"
+                password_hash = get_password_hash(default_password)
+                full_name = teacher_name if teacher_name else teacher_username
+                
+                cursor.execute(
+                    """
+                    INSERT INTO teachers (teacher_id, name, email, password)
+                    VALUES (%s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        name = VALUES(name),
+                        email = VALUES(email),
+                        password = VALUES(password),
+                        updated_at = NOW()
+                    """,
+                    (teacher_username, full_name, email, password_hash),
+                )
+                
+                # 获取记录ID
+                cursor.execute("SELECT id FROM teachers WHERE teacher_id = %s", (teacher_username,))
+                rid = cursor.fetchone()
+                rec_id = rid[0] if rid else None
+                
+                if cursor.rowcount == 1:
+                    created_teachers += 1
+                    created_teacher_items.append({"user_type": "teacher", "username": teacher_username, "name": full_name, "id": rec_id})
+                else:
+                    updated_teachers += 1
+                    updated_teacher_items.append({"user_type": "teacher", "username": teacher_username, "name": full_name, "id": rec_id})
+        
+        db.commit()
+        return {
+            "message": "导入完成",
+            "students_created": created_students,
+            "students_updated": updated_students,
+            "teachers_created": created_teachers,
+            "teachers_updated": updated_teachers,
+            "created_students": created_student_items,
+            "updated_students": updated_student_items,
+            "created_teachers": created_teacher_items,
+            "updated_teachers": updated_teacher_items,
+        }
+    except pymysql.MySQLError as e:
+        db.rollback()
+        logger.error(f"中国计量大学信息工程学院用户导入数据库错误: {str(e)}")
+        raise HTTPException(status_code=500, detail="用户导入失败")
+    finally:
+        if cursor:
+            cursor.close()
+
+
+@router.get(
+    "/all",
+    summary="查询所有用户",
+    description="管理员查询学生、教师或管理员表中的所有人的信息，支持三选一或查询全部"
+)
+def get_all_users(
+    user_type: Optional[str] = Query(None, description="用户类型：student/teacher/admin，不指定则查询全部"),
+    db: pymysql.connections.Connection = Depends(get_db),
+    current_user: Optional[str] = Query(None, description="管理员信息(JSON字符串，包含 sub/username/roles)"),
+):
+    # 解析当前用户信息
+    current_user_info = _parse_current_user(current_user)
+    # 验证当前用户是管理员
+    user_roles = current_user_info.get("roles", [])
+    if "admin" not in user_roles and "管理员" not in user_roles:
+        raise HTTPException(status_code=403, detail="仅管理员可执行此操作")
+    
+    cursor = None
+    try:
+        cursor = db.cursor(pymysql.cursors.DictCursor)
+        
+        # 构建查询
+        results = []
+        
+        # 如果指定了用户类型，只查询对应表
+        if user_type:
+            user_type = _normalize_user_type(user_type)
+            info = USER_TABLES[user_type]
+            table = info["table"]
+            id_col = info["id_col"]
+            
+            if user_type == "admin":
+                cursor.execute(f"""
+                    SELECT 
+                        {id_col} as user_id, 
+                        name,
+                        created_at,
+                        updated_at
+                    FROM {table}
+                """)
+            else:
+                cursor.execute(f"""
+                    SELECT 
+                        {id_col} as user_id, 
+                        name,
+                        created_at,
+                        updated_at
+                    FROM {table}
+                """)
+            
+            rows = cursor.fetchall()
+            for row in rows:
+                row["user_type"] = user_type
+                # 转换日期时间格式
+                if "created_at" in row and row["created_at"]:
+                    if isinstance(row["created_at"], datetime):
+                        row["created_at"] = row["created_at"].strftime("%Y-%m-%d %H:%M:%S")
+                if "updated_at" in row and row["updated_at"]:
+                    if isinstance(row["updated_at"], datetime):
+                        row["updated_at"] = row["updated_at"].strftime("%Y-%m-%d %H:%M:%S")
+                results.append(row)
+        else:
+            # 查询所有三个表
+            for ut in ["student", "teacher", "admin"]:
+                info = USER_TABLES[ut]
+                table = info["table"]
+                id_col = info["id_col"]
+                
+                if ut == "admin":
+                    cursor.execute(f"""
+                        SELECT 
+                            {id_col} as user_id, 
+                            name,
+                            created_at,
+                            updated_at
+                        FROM {table}
+                    """)
+                else:
+                    cursor.execute(f"""
+                        SELECT 
+                            {id_col} as user_id, 
+                            name,
+                            created_at,
+                            updated_at
+                        FROM {table}
+                    """)
+                
+                rows = cursor.fetchall()
+                for row in rows:
+                    row["user_type"] = ut
+                    # 转换日期时间格式
+                    if "created_at" in row and row["created_at"]:
+                        if isinstance(row["created_at"], datetime):
+                            row["created_at"] = row["created_at"].strftime("%Y-%m-%d %H:%M:%S")
+                    if "updated_at" in row and row["updated_at"]:
+                        if isinstance(row["updated_at"], datetime):
+                            row["updated_at"] = row["updated_at"].strftime("%Y-%m-%d %H:%M:%S")
+                    results.append(row)
+        
+        return {
+            "code": 200,
+            "message": "查询成功",
+            "data": results
+        }
+    except HTTPException:
+        raise
+    except pymysql.MySQLError as e:
+        logger.error(f"查询所有用户数据库错误: {str(e)}")
+        raise HTTPException(status_code=500, detail="查询所有用户失败")
+    finally:
+        if cursor:
+            cursor.close()
 
 @router.put(
     "/{user_id}/bind-phone",
@@ -1863,3 +2430,5 @@ def change_user_role(
     finally:
         if cursor:
             cursor.close()
+
+
